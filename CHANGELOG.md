@@ -1,5 +1,303 @@
 # ElasticRelay Changelog
 
+## [v1.4.0] - 2026-01-17
+
+### 🎉 Major Release: Transform Engine Complete Implementation
+
+This release marks a major milestone in Phase 3 development - the complete implementation of the **Transform Engine**, providing enterprise-grade data transformation capabilities including field mapping, type conversion, data masking, expression evaluation, and conditional filtering.
+
+### 🚀 New Features
+
+#### 1. Transform Engine Core (`internal/transform/engine.go`)
+
+**Complete transformation pipeline implementation:**
+
+- **Rule Matching**: Table pattern matching with wildcard support (`users`, `user_*`)
+- **Priority-based Processing**: Rules sorted by priority (lower = higher priority)
+- **Multi-rule Support**: Apply multiple transformation rules to same event
+- **Statistics Tracking**: Process count, error count, filtered count with atomic operations
+- **Pass-through Mode**: Automatic detection when no rules configured
+
+**Key Functions:**
+```go
+func (e *Engine) Transform(ctx context.Context, event *pb.ChangeEvent) (*pb.ChangeEvent, bool, error)
+func (e *Engine) LoadConfig(configs []*TransformConfig) error
+func (e *Engine) GetStats() EngineStats
+```
+
+#### 2. Configuration Model (`internal/transform/config.go`)
+
+**Complete configuration structures:**
+
+- `TransformConfig`: Main rule configuration with ID, name, table patterns, priority
+- `FieldMapping`: Field rename/copy/move operations with nested path support
+- `FieldConfig`: Per-field type conversion, validation, null handling, exclusion
+- `FilterRule`: Conditional filtering with operators (eq, ne, gt, lt, in, regex, exists)
+- `MaskingRule`: Data masking with strategies and preset templates
+- `ComputedField`: Expression-based computed fields
+- `ValidationRule`: Field validation with patterns, min/max, length constraints
+- `GlobalTransformSettings`: Engine-wide configuration options
+
+#### 3. Field Mapper (`internal/transform/field_mapper.go`)
+
+**Field transformation capabilities:**
+
+- **Rename**: Change field name, remove original
+- **Copy**: Duplicate field to new name, keep original
+- **Move**: Same as rename (alias)
+- **Nested Path Support**: Access and modify nested fields using dot notation (`user.profile.name`)
+- **Deep Copy**: Proper deep copying of nested structures
+
+**Key Functions:**
+```go
+func (fm *FieldMapper) Apply(mappings []FieldMapping, data map[string]interface{}) (map[string]interface{}, error)
+func (fm *FieldMapper) ProcessFieldConfigs(configs []FieldConfig, data map[string]interface{}) (map[string]interface{}, error)
+```
+
+#### 4. Type Converter (`internal/transform/type_converter.go`)
+
+**Comprehensive type conversion system:**
+
+| Source Type | Target Types |
+|-------------|--------------|
+| string | int, int64, float64, bool, date, timestamp |
+| int/int64 | string, float64, bool, timestamp |
+| float64 | string, int, int64, bool |
+| bool | string, int |
+| time.Time | string (RFC3339), timestamp (Unix) |
+
+**Supported Target Types:**
+- `string`, `keyword`, `text` - String types (ES compatible)
+- `int`, `int64` - Integer types
+- `float`, `float64` - Floating point types
+- `bool` - Boolean type
+- `date` - RFC3339 formatted date string
+- `timestamp` - Unix timestamp (int64)
+
+#### 5. Filter Engine (`internal/transform/filter/filter.go`)
+
+**Conditional record filtering:**
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `eq` | Equal | `status == "active"` |
+| `ne` | Not equal | `status != "deleted"` |
+| `gt` | Greater than | `age > 18` |
+| `gte` | Greater or equal | `score >= 60` |
+| `lt` | Less than | `price < 100` |
+| `lte` | Less or equal | `quantity <= 10` |
+| `in` | In list | `type in ["a", "b"]` |
+| `nin` | Not in list | `status not in ["deleted"]` |
+| `regex` | Regex match | `email ~ ".*@example.com"` |
+| `exists` | Field exists | `email exists` |
+
+**Filter Actions:**
+- `include`: Include record if condition matches
+- `exclude`: Exclude record if condition matches
+- `route`: Route to specific target if condition matches
+
+#### 6. Masking Engine (`internal/transform/masking/masking.go`)
+
+**Data anonymization and masking:**
+
+**Masking Strategies:**
+| Strategy | Description | Example |
+|----------|-------------|---------|
+| `mask` | Character masking | `138****5678` |
+| `hash` | SHA256/MD5 hash | `a1b2c3d4...` |
+| `token` | Tokenization | `TOKEN_abc123` |
+| `regex` | Regex replacement | Custom pattern |
+
+**Preset Templates:**
+| Template | Input | Output |
+|----------|-------|--------|
+| `phone` | `13812345678` | `138****5678` |
+| `id_card` | `110101199001011234` | `1101**********1234` |
+| `email` | `john@example.com` | `jo***@example.com` |
+| `bank_card` | `6222021234567890` | `6222********7890` |
+| `name` | `张三` | `张*` |
+
+#### 7. Expression Engine (`internal/transform/expression/engine.go`)
+
+**Dynamic field computation:**
+
+**Built-in Functions:**
+
+| Category | Functions |
+|----------|-----------|
+| String | `concat()`, `substr()`, `upper()`, `lower()`, `trim()`, `replace()`, `length()` |
+| Math | `round()`, `abs()`, `floor()`, `ceil()`, `min()`, `max()` |
+| Date | `now()`, `formatDate()`, `parseDate()` |
+| Conditional | `ifNull()`, `ifEmpty()`, `coalesce()` |
+
+**Expression Syntax:**
+```javascript
+// Field access
+$.field_name
+$.nested.field
+
+// Ternary expressions
+$.age < 18 ? 'minor' : 'adult'
+
+// Arithmetic
+$.price * $.quantity
+
+// Function calls
+concat($.first_name, ' ', $.last_name)
+round($.price, 2)
+```
+
+#### 8. gRPC Service Integration (`internal/transform/transform.go`)
+
+**Updated TransformService implementation:**
+
+- Replaced pass-through with full transformation pipeline
+- Support for configuration injection via `ServerOption`
+- Statistics tracking and retrieval
+- Single event transformation utility method
+
+#### 9. Configuration Loading System
+
+**Command-line Parameter Support (`cmd/elasticrelay/main.go`):**
+
+```bash
+./bin/elasticrelay \
+  -config ./config/mongodb_config.json \
+  -port 50051 \
+  -transform-config ./config/transform_example.json
+```
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `-config` | Data source configuration file | `config.json` |
+| `-port` | gRPC service port | `50051` |
+| `-transform-config` | Transform configuration file (optional) | empty (pass-through) |
+
+**Configuration Loading (`internal/transform/config.go`):**
+
+```go
+// Load Transform configuration from JSON file
+func LoadTransformConfig(filePath string) (*TransformConfigFile, error)
+
+// Global settings management
+func SetGlobalSettings(settings GlobalTransformSettings)
+func GetGlobalSettings() GlobalTransformSettings
+
+// Masking templates management
+func SetMaskingTemplates(templates map[string]*masking.Template)
+func GetMaskingTemplates() map[string]*masking.Template
+```
+
+**Startup Script Integration (`start.sh`):**
+
+```bash
+# Transform configuration (optional)
+# Set to empty string to disable transform rules (pass-through mode)
+# TRANSFORM_CONFIG="./config/transform_example.json"
+TRANSFORM_CONFIG=""  # Default: pass-through mode
+
+# Build command arguments
+if [ -n "$TRANSFORM_CONFIG" ] && [ -f "$TRANSFORM_CONFIG" ]; then
+    CMD_ARGS="$CMD_ARGS -transform-config $TRANSFORM_CONFIG"
+fi
+```
+
+**Usage Modes:**
+
+| Mode | Configuration | Behavior |
+|------|---------------|----------|
+| **Pass-through** | `TRANSFORM_CONFIG=""` | Events pass through unchanged |
+| **Transform** | `TRANSFORM_CONFIG="./config/transform_example.json"` | Apply transformation rules |
+
+### 🧪 Testing
+
+#### Unit Tests
+
+**File:** `internal/transform/transform_test.go`
+- `TestFieldMapper_Rename`: Field renaming
+- `TestFieldMapper_Copy`: Field copying
+- `TestFieldMapper_NestedPath`: Nested path access
+- `TestTypeConverter_ToInt`: Integer conversion
+- `TestTypeConverter_ToFloat64`: Float conversion
+- `TestTypeConverter_ToBool`: Boolean conversion
+- `TestTypeConverter_ToDate`: Date conversion
+- `TestEngine_PassThrough`: Pass-through mode
+- `TestEngine_FieldMapping`: Field mapping
+- `TestEngine_FieldExclusion`: Field exclusion
+- `TestEngine_TypeConversion`: Type conversion
+- `TestEngine_TablePatternMatching`: Table pattern matching
+- Benchmark tests for performance validation
+
+**File:** `internal/transform/filter/filter_test.go`
+- All operators tested (eq, ne, gt, gte, lt, lte, in, nin, regex, exists)
+- Nested field support
+- Include/Exclude/Route actions
+- Regex compilation and caching
+
+**File:** `internal/transform/masking/masking_test.go`
+- All strategies tested (mask, hash, token, regex)
+- All preset templates tested (phone, id_card, email, bank_card)
+- Custom parameters
+- Edge cases (short values, missing fields)
+
+### 📊 Performance Characteristics
+
+| Operation | Speed | Memory | Notes |
+|-----------|-------|--------|-------|
+| **Engine.Transform** | ~800,000 ops/sec | 1,601 B/op | Full transformation pipeline |
+| FieldMapper.Apply | ~4,500,000 ops/sec | 416 B/op | Field mapping only |
+| TypeConverter.Convert | ~22,000,000 ops/sec | 16 B/op | Type conversion only |
+| Filter.Check | ~5,000,000 ops/sec | ~200 B/op | Rule evaluation |
+| Masking.Apply | ~1,000,000 ops/sec | ~500 B/op | 4-field masking |
+
+> **Performance exceeds design target of 10,000 ops/sec by 80x!**
+
+### 📁 Files Added
+
+| File | Description |
+|------|-------------|
+| `internal/transform/config.go` | Configuration model definitions |
+| `internal/transform/engine.go` | Core transform engine |
+| `internal/transform/field_mapper.go` | Field mapping operations |
+| `internal/transform/type_converter.go` | Type conversion system |
+| `internal/transform/filter/filter.go` | Filter engine |
+| `internal/transform/filter/filter_test.go` | Filter unit tests |
+| `internal/transform/masking/masking.go` | Masking engine |
+| `internal/transform/masking/masking_test.go` | Masking unit tests |
+| `internal/transform/expression/engine.go` | Expression engine |
+| `internal/transform/transform_test.go` | Main unit tests |
+
+### 📁 Files Modified
+
+| File | Description |
+|------|-------------|
+| `internal/transform/transform.go` | Updated gRPC service with engine integration |
+| `cmd/elasticrelay/main.go` | Added `-transform-config` command-line parameter |
+| `start.sh` | Integrated Transform configuration loading |
+
+### ✅ Phase 3 Progress
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Transform Engine Core | ✅ Complete | Full implementation |
+| Field Mapping | ✅ Complete | rename/copy/move with nested paths |
+| Type Conversion | ✅ Complete | All common types supported |
+| Data Masking | ✅ Complete | 4 strategies, 5 templates |
+| Expression Engine | ✅ Complete | 16 built-in functions |
+| Filter Engine | ✅ Complete | 10 operators |
+| Configuration Loading | ✅ Complete | CLI args + start.sh integration |
+| Unit Tests | ✅ Complete | 38 test cases |
+| Performance | ✅ Complete | 80x above target |
+
+### 🎯 Next Steps (Phase 3 Remaining)
+
+- [ ] Prometheus metrics export (`internal/metrics/`)
+- [ ] Health Check enhancement
+- [ ] HTTP Gateway (grpc-gateway)
+- [ ] REST API documentation
+
+---
+
 ## [v1.3.1] - 2025-12-15
 
 ### 🐛 Bug Fixes

@@ -11,6 +11,11 @@ PORT="50051"
 LOG_DIR="./logs"
 PID_FILE="./logs/elasticrelay.pid"
 
+# Transform configuration (optional)
+# Set to empty string to disable transform rules (pass-through mode)
+# TRANSFORM_CONFIG="./config/transform_example.json"
+TRANSFORM_CONFIG=""  # Uncomment to disable transform
+
 # Create logs directory if it doesn't exist
 mkdir -p "$LOG_DIR"
 
@@ -40,6 +45,17 @@ if [ ! -f "$CONFIG" ]; then
     exit 1
 fi
 
+# Build command arguments
+CMD_ARGS="-config $CONFIG -port $PORT"
+
+# Add transform config if specified and file exists
+if [ -n "$TRANSFORM_CONFIG" ] && [ -f "$TRANSFORM_CONFIG" ]; then
+    CMD_ARGS="$CMD_ARGS -transform-config $TRANSFORM_CONFIG"
+    echo "Transform Config: $TRANSFORM_CONFIG"
+else
+    echo "Transform Config: (none - pass-through mode)"
+fi
+
 echo "Starting ElasticRelay service..."
 echo "Binary: $BINARY"
 echo "Config: $CONFIG"
@@ -49,7 +65,7 @@ echo "Logs: $LOG_DIR"
 # Start the service
 if [ "$1" == "-d" ] || [ "$1" == "--daemon" ]; then
     # Run in background
-    nohup "$BINARY" -config "$CONFIG" -port "$PORT" > "$LOG_DIR/backend.log" 2>&1 &
+    nohup "$BINARY" $CMD_ARGS > "$LOG_DIR/backend.log" 2>&1 &
     PID=$!
     echo $PID > "$PID_FILE"
     echo "ElasticRelay started in background with PID: $PID"
@@ -61,7 +77,7 @@ else
     echo ""
     
     # Start the process in background to get its PID
-    "$BINARY" -config "$CONFIG" -port "$PORT" &
+    "$BINARY" $CMD_ARGS &
     PROCESS_PID=$!
     
     # Write the actual process PID to file

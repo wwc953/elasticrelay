@@ -46,9 +46,10 @@ func (d *DummySinkServer) DescribeIndex(ctx context.Context, req *pb.DescribeInd
 func main() {
 	// Command-line flags
 	var (
-		showVersion = flag.Bool("version", false, "Show version information and exit")
-		port        = flag.String("port", "50051", "gRPC service port")
-		configFile  = flag.String("config", "config.json", "Path to the configuration file")
+		showVersion     = flag.Bool("version", false, "Show version information and exit")
+		port            = flag.String("port", "50051", "gRPC service port")
+		configFile      = flag.String("config", "config.json", "Path to the configuration file")
+		transformConfig = flag.String("transform-config", "", "Path to the transform configuration file (optional)")
 	)
 	flag.Parse()
 
@@ -114,10 +115,30 @@ func main() {
 				strings.Title(ds.Type), ds.ID)
 		}
 
-		// Create transform server
-		transServer, err := transform.NewServer()
-		if err != nil {
-			log.Fatalf("failed to create transform server: %v", err)
+		// Create transform server with optional configuration
+		var transServer *transform.Server
+		if *transformConfig != "" {
+			log.Printf("Loading transform configuration from %s", *transformConfig)
+			transformConfigs, err := transform.LoadTransformConfig(*transformConfig)
+			if err != nil {
+				log.Printf("⚠️  Warning: failed to load transform config: %v", err)
+				log.Printf("⚠️  Transform engine will run in pass-through mode")
+				transServer, err = transform.NewServer()
+				if err != nil {
+					log.Fatalf("failed to create transform server: %v", err)
+				}
+			} else {
+				transServer, err = transform.NewServer(transform.WithConfigs(transformConfigs))
+				if err != nil {
+					log.Fatalf("failed to create transform server: %v", err)
+				}
+				log.Printf("✅ Transform engine loaded with %d rules", len(transformConfigs))
+			}
+		} else {
+			transServer, err = transform.NewServer()
+			if err != nil {
+				log.Fatalf("failed to create transform server: %v", err)
+			}
 		}
 
 		// Create sink servers for each sink configuration
@@ -234,9 +255,30 @@ func main() {
 			log.Fatalf("failed to create orchestrator server: %v", err)
 		}
 
-		transServer, err := transform.NewServer()
-		if err != nil {
-			log.Fatalf("failed to create transform server: %v", err)
+		// Create transform server with optional configuration (legacy mode)
+		var transServer *transform.Server
+		if *transformConfig != "" {
+			log.Printf("Loading transform configuration from %s", *transformConfig)
+			transformConfigs, err := transform.LoadTransformConfig(*transformConfig)
+			if err != nil {
+				log.Printf("⚠️  Warning: failed to load transform config: %v", err)
+				log.Printf("⚠️  Transform engine will run in pass-through mode")
+				transServer, err = transform.NewServer()
+				if err != nil {
+					log.Fatalf("failed to create transform server: %v", err)
+				}
+			} else {
+				transServer, err = transform.NewServer(transform.WithConfigs(transformConfigs))
+				if err != nil {
+					log.Fatalf("failed to create transform server: %v", err)
+				}
+				log.Printf("✅ Transform engine loaded with %d rules", len(transformConfigs))
+			}
+		} else {
+			transServer, err = transform.NewServer()
+			if err != nil {
+				log.Fatalf("failed to create transform server: %v", err)
+			}
 		}
 
 		// Create and register all services on one gRPC server
