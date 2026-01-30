@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -121,11 +122,8 @@ func (e *Engine) Apply(rules []Rule, data map[string]interface{}) (map[string]in
 			continue
 		}
 
-		// Convert value to string
-		strValue, ok := value.(string)
-		if !ok {
-			strValue = fmt.Sprintf("%v", value)
-		}
+		// Convert value to string (handle numeric types properly to avoid scientific notation)
+		strValue := valueToString(value)
 
 		// Skip empty values
 		if strValue == "" {
@@ -265,6 +263,55 @@ func getStringParam(params map[string]interface{}, key string, defaultValue stri
 		return v
 	}
 	return defaultValue
+}
+
+// valueToString converts any value to a string, properly handling numeric types
+// to avoid scientific notation for large numbers (e.g., phone numbers, ID cards).
+func valueToString(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case int:
+		return strconv.Itoa(v)
+	case int8:
+		return strconv.FormatInt(int64(v), 10)
+	case int16:
+		return strconv.FormatInt(int64(v), 10)
+	case int32:
+		return strconv.FormatInt(int64(v), 10)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	case float32:
+		// Check if it's a whole number (like phone number stored as float)
+		if float64(v) == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case float64:
+		// Check if it's a whole number (like phone number stored as float)
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", value)
+	}
 }
 
 // MaskPhone masks a phone number (e.g., 13812345678 -> 138****5678).

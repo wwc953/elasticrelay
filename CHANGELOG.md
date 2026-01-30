@@ -1,5 +1,283 @@
 # ElasticRelay Changelog
 
+## [v1.4.2] - 2026-01-30
+
+### 🔧 Transform Rule Matching Fix
+
+This release fixes a critical issue where transform rules with `source_id` configuration were not matching events due to `Checkpoint.SourceType` being lost during gRPC transmission.
+
+### 🐛 Bug Fixes
+
+#### 1. Source ID Matching Fix (`internal/orchestrator/multi_orchestrator.go`)
+
+**Fixed `_source_id` not being passed to Transform Engine:**
+
+- **Issue**: `Checkpoint.SourceType` was correctly set when sending events via gRPC, but the value was lost (empty string) when received by Transform Service, causing transform rules with `source_id` configuration to fail matching
+- **Root Cause**: gRPC protobuf transmission was dropping the `SourceType` field from nested `Checkpoint` message
+- **Fix**: Embed `_source_id` field directly into event data JSON, bypassing the unreliable Checkpoint transmission
+- **Impact**: Transform rules with `source_id` configuration now correctly match events
+
+```go
+// Added _source_id to snapshot event data
+recordData["_table"] = tableName
+recordData["_source_id"] = j.SourceID  // New: reliable source_id transmission
+
+// Added enrichEventWithSourceID for CDC events
+func (j *MultiJob) enrichEventWithSourceID(event *pb.ChangeEvent) {
+    // Parse event data JSON
+    // Add _source_id field if not present
+    // Re-serialize to JSON
+}
+```
+
+#### 2. Transform Engine Enhancement (`internal/transform/engine.go`)
+
+**Added `_source_id` extraction from event data:**
+
+- **Issue**: Transform engine only extracted `sourceType` from `Checkpoint`, which was unreliable
+- **Fix**: Added `extractSourceID()` method to extract `_source_id` from event data JSON, with fallback to `Checkpoint.SourceType`
+- **Impact**: Source ID matching now works reliably for transform rule filtering
+
+```go
+// Extract source_id from data first (more reliable), fallback to Checkpoint
+sourceType := e.extractSourceID(data)
+if sourceType == "" && event.Checkpoint != nil {
+    sourceType = event.Checkpoint.SourceType
+}
+
+func (e *Engine) extractSourceID(data map[string]interface{}) string {
+    if val, ok := data["_source_id"].(string); ok && val != "" {
+        return val
+    }
+    return ""
+}
+```
+
+#### 3. ES Sink Cleanup (`internal/sink/es/es.go`)
+
+**Added `_source_id` to metadata cleanup:**
+
+- **Issue**: `_source_id` metadata field would be stored in Elasticsearch documents
+- **Fix**: Added `_source_id` to the list of metadata fields to remove before ES storage
+- **Impact**: Clean documents without internal metadata fields
+
+```go
+// Remove metadata fields
+delete(data, "_table")
+delete(data, "_source_id")  // New: remove transform matching metadata
+delete(data, "_schema")
+```
+
+### 📝 Configuration Updates
+
+#### Transform Configuration (`config/mysql_transform.json`)
+
+**Fixed `source_id` configuration:**
+
+- **Issue**: All MySQL transform rules had empty `source_id: ""`, which was a global rule matching all sources
+- **Fix**: Updated all MySQL-specific transform rules to use `source_id: "mysql-main"` to match the data source ID in `mysql_config.json`
+- **Impact**: Transform rules now explicitly bind to specific data sources, preventing unintended rule matching across different sources
+
+Updated rules:
+- `user-data-transform`: `source_id: ""` → `source_id: "mysql-main"`
+- `order-data-transform`: `source_id: ""` → `source_id: "mysql-main"`
+- `log-data-transform`: Added `source_id: "mysql-main"`
+- `mysql-users-transform`: `source_id: ""` → `source_id: "mysql-main"`
+- `mysql-orders-transform`: `source_id: ""` → `source_id: "mysql-main"`
+- `mysql-products-transform`: `source_id: ""` → `source_id: "mysql-main"`
+- `test-table-transform`: `source_id: ""` → `source_id: "mysql-main"`
+
+### ✅ Verification
+
+After this fix, transform rules correctly match and apply transformations:
+
+```
+Before: Transform: Table='mysql_users' matched 0 rules: []
+After:  Transform: Table='mysql_users' matched 1 rules: [mysql-users-transform]
+```
+
+Transform features now working:
+- ✅ Field mapping (e.g., `user_name` → `username`)
+- ✅ Data masking (phone: `138****5678`, email: `zh***@example.com`)
+- ✅ Password hashing (SHA256)
+- ✅ Computed fields (`full_name`, `age_group`, `processed_at`)
+- ✅ Record filtering (exclude test users and deleted records)
+- ✅ Type conversion (`is_vip`: number → boolean)
+
+---
+
+## [v1.4.1] - 2026-01-30
+
+### 🔧 Transform Engine Integration & Bug Fixes
+
+This release fixes critical issues that prevented the Transform Engine from working correctly in production. The Transform Engine is now fully operational with complete data transformation pipeline support.
+
+### 🐛 Bug Fixes
+
+#### 1. Transform Service Integration (`internal/orchestrator/multi_orchestrator.go`)
+
+**Fixed `transformEvents` method not calling Transform Service:**
+
+- **Issue**: The `transformEvents` method was a placeholder implementation that simply returned events unchanged (pass-through mode)
+- **Fix**: Implemented actual gRPC call to Transform Service via `ApplyRules` stream
+- **Impact**: Transform rules now properly execute during both Initial Sync and CDC
+
+```go
+// Before (placeholder)
+func (j *MultiJob) transformEvents(events []*pb.ChangeEvent) []*pb.ChangeEvent {
+    return events // No transformation!
+}
+
+// After (working implementation)
+func (j *MultiJob) transformEvents(events []*pb.ChangeEvent) []*pb.ChangeEvent {
+    // Opens gRPC stream to Transform Service
+    // Sends all events for transformation
+    // Receives and returns transformed/filtered events
+}
+```
+
+**Fixed missing table name in snapshot events:**
+
+- **Issue**: ChangeEvents created during Initial Sync were missing `_table` field, preventing rule matching
+- **Fix**: Added `_table` field to enriched record data before creating ChangeEvent
+- **Impact**: Transform rules can now match tables correctly during Initial Sync
+
+**Fixed missing SourceType in Checkpoint:**
+
+- **Issue**: ChangeEvents were missing `SourceType` in Checkpoint, causing source_id matching to fail
+- **Fix**: Set `Checkpoint.SourceType = j.SourceID` when creating events
+
+#### 2. Type Converter Enhancement (`internal/transform/type_converter.go`)
+
+**Added `object` type support:**
+
+- **Issue**: JSON object fields (like MySQL JSON columns) failed with "unsupported target type: object"
+- **Fix**: Added `DataTypeObject` constant and `toObject()` pass-through converter
+- **Impact**: JSON fields now correctly pass through without conversion errors
+
+```go
+tc.Register(DataTypeObject, tc.toObject) // JSON object type (pass-through)
+
+func (tc *TypeConverter) toObject(value interface{}) (interface{}, error) {
+    return value, nil // Pass through unchanged
+}
+```
+
+#### 3. Data Masking Engine (`internal/transform/masking/masking.go`)
+
+**Fixed numeric value handling in masking:**
+
+- **Issue**: Large numeric values (phone numbers, ID cards) were converted to scientific notation (e.g., `1.38e+10`)
+- **Fix**: Added `valueToString()` function that properly formats numeric types without scientific notation
+- **Impact**: Phone numbers, ID cards, bank cards are now correctly masked (e.g., `138****5678`)
+
+```go
+func valueToString(value interface{}) string {
+    switch v := value.(type) {
+    case int64:
+        return strconv.FormatInt(v, 10)
+    case float64:
+        if v == float64(int64(v)) {
+            return strconv.FormatInt(int64(v), 10)
+        }
+        return strconv.FormatFloat(v, 'f', -1, 64)
+    // ... handles all numeric types
+    }
+}
+```
+
+#### 4. MySQL Connector (`internal/connectors/mysql/mysql.go`)
+
+**Fixed long numeric strings being converted to numbers:**
+
+- **Issue**: VARCHAR fields containing long numeric strings (phone, ID card, bank card) were parsed as int64, causing precision loss in JSON serialization
+- **Fix**: Only convert strings to numbers if length ≤ 10 digits
+- **Impact**: Phone numbers (11 digits), ID cards (18 digits), bank cards (16-19 digits) remain as strings
+
+```go
+// Only convert short numeric strings to avoid precision issues
+if len(s) <= 10 {
+    if num, err := strconv.ParseInt(s, 10, 64); err == nil {
+        dataMap[colName] = num
+    }
+} else {
+    // Keep long numeric strings as strings
+    dataMap[colName] = s
+}
+```
+
+### 📝 Configuration Updates
+
+#### Transform Configuration (`config/mysql_transform.json`)
+
+**Fixed source_id matching:**
+
+- Changed `source_id` from `"mysql-main"` to `""` (empty) for global rule matching
+- Rules now match regardless of data source identifier
+
+**Fixed is_test filter:**
+
+- Changed filter value from `true` to `1` to match MySQL's numeric boolean representation
+
+**Fixed full_name expression:**
+
+- Simplified from `concat($.last_name || '', $.first_name || '')` to `concat($.last_name, $.first_name)`
+- Expression now correctly generates Chinese names (e.g., "张三")
+
+**Added sensitive field type configurations:**
+
+```json
+{
+  "field": "phone",
+  "target_type": "keyword",
+  "description": "Ensure phone is string for masking"
+},
+{
+  "field": "bank_card",
+  "target_type": "keyword",
+  "description": "Ensure bank_card is string for masking"
+}
+```
+
+#### SQL Schema Updates (`config/mysql/init-mysql.sql`)
+
+**Added Transform-compatible test tables:**
+
+- `users` - Matches `user-data-transform` rule with all required fields
+- `orders` - Matches `order-data-transform` rule
+- `audit_logs` - Matches `log-data-transform` rule
+
+**Added Transform rules for existing tables:**
+
+- `mysql-users-transform` - For `mysql_users` table
+- `mysql-orders-transform` - For `mysql_orders` table
+- `mysql-products-transform` - For `mysql_products` table
+- `test-table-transform` - For `test_table`
+
+### ✅ Verified Transform Features
+
+| Feature | Status | Example |
+|---------|--------|---------|
+| Field Rename | ✅ | `user_name` → `username` |
+| Field Copy | ✅ | `created_at` → `create_time` |
+| Field Exclude | ✅ | `internal_notes`, `debug_info` removed |
+| Type Conversion | ✅ | `is_vip: 1` → `is_vip: true` |
+| Phone Masking | ✅ | `13812345678` → `138****5678` |
+| ID Card Masking | ✅ | `110101199001011234` → `1101**********1234` |
+| Bank Card Masking | ✅ | `6222021234567890123` → `6222***********0123` |
+| Email Masking | ✅ | `zhangsan@example.com` → `zh***@example.com` |
+| Password Hashing | ✅ | SHA256 hash |
+| Address Masking | ✅ | `北京市朝阳区建国路100号` → `北京市朝阳区*******` |
+| Computed Fields | ✅ | `full_name`, `age_group`, `display_balance` |
+| Record Filtering | ✅ | `status='deleted'` and `is_test=1` filtered out |
+
+### 📊 Test Results
+
+**Before fixes:** 5 records with no transformation (pass-through mode)
+**After fixes:** 3 records with full transformation applied
+
+---
+
 ## [v1.4.0] - 2026-01-17
 
 ### 🎉 Major Release: Transform Engine Complete Implementation

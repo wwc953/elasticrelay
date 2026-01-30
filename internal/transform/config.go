@@ -257,6 +257,7 @@ const (
 	DataTypeTimestamp = "timestamp"
 	DataTypeKeyword   = "keyword" // ES keyword type
 	DataTypeText      = "text"    // ES text type
+	DataTypeObject    = "object"  // JSON object type (pass-through)
 )
 
 // LoadTransformConfig loads transform configuration from a JSON file.

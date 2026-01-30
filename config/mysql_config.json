@@ -11,7 +11,7 @@
       "password": "elasticrelay_pass",
       "database": "elasticrelay",
       "server_id": 100,
-      "table_filters": ["mysql_users", "mysql_orders", "mysql_products", "test_table"],
+      "table_filters": ["mysql_users", "mysql_orders", "mysql_products", "test_table", "users", "orders", "audit_logs"],
       "options": {
         "charset": "utf8mb4",
         "timeout": "30s",

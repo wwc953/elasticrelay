@@ -450,6 +450,14 @@ type jobCDCStream struct {
 
 // Send processes CDC events for the specific job
 func (s *jobCDCStream) Send(event *pb.ChangeEvent) error {
+	// Ensure SourceType is set for transform rule matching
+	if event.Checkpoint != nil {
+		event.Checkpoint.SourceType = s.job.SourceID
+	} else {
+		event.Checkpoint = &pb.Checkpoint{
+			SourceType: s.job.SourceID,
+		}
+	}
 	s.job.addToBatch(event)
 	return nil
 }
@@ -528,6 +536,11 @@ func (j *MultiJob) flushBatch() {
 	log.Printf("MultiJob '%s': Flushing batch of %d events (%s -> %s)",
 		j.ID, len(j.batch), j.SourceID, j.SinkID)
 
+	// Enrich CDC events with _source_id for transform rule matching
+	for _, event := range j.batch {
+		j.enrichEventWithSourceID(event)
+	}
+
 	// Transform events
 	transformedEvents := j.transformEvents(j.batch)
 	if len(transformedEvents) == 0 {
@@ -576,10 +589,61 @@ func (j *MultiJob) flushBatch() {
 	j.batch = nil
 }
 
-// transformEvents applies transformation rules
+// transformEvents applies transformation rules via the Transform Service
 func (j *MultiJob) transformEvents(events []*pb.ChangeEvent) []*pb.ChangeEvent {
-	// Simplified transform - in production, use the actual transform service
-	return events
+	if len(events) == 0 {
+		return events
+	}
+
+	// If no transform client, pass through
+	if j.transformClient == nil {
+		log.Printf("MultiJob '%s': No transform client configured, passing through %d events", j.ID, len(events))
+		return events
+	}
+
+	ctx, cancel := context.WithTimeout(j.ctx, 30*time.Second)
+	defer cancel()
+
+	// Open transform stream
+	transformStream, err := j.transformClient.ApplyRules(ctx)
+	if err != nil {
+		log.Printf("MultiJob '%s': Failed to open transform stream: %v, passing through events", j.ID, err)
+		return events
+	}
+
+	// Send all events to transform service
+	for _, event := range events {
+		if err := transformStream.Send(event); err != nil {
+			log.Printf("MultiJob '%s': Failed to send event to transform: %v, passing through remaining events", j.ID, err)
+			return events
+		}
+	}
+
+	// Close send stream
+	if err := transformStream.CloseSend(); err != nil {
+		log.Printf("MultiJob '%s': Failed to close transform send stream: %v", j.ID, err)
+		return events
+	}
+
+	// Collect transformed events
+	transformedEvents := make([]*pb.ChangeEvent, 0, len(events))
+	for {
+		event, err := transformStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("MultiJob '%s': Failed to receive from transform: %v, returning partial results", j.ID, err)
+			break
+		}
+		transformedEvents = append(transformedEvents, event)
+	}
+
+	if len(transformedEvents) != len(events) {
+		log.Printf("MultiJob '%s': Transform filtered %d/%d events", j.ID, len(events)-len(transformedEvents), len(events))
+	}
+
+	return transformedEvents
 }
 
 // sendToSink sends events to the configured sink
@@ -597,6 +661,25 @@ func (j *MultiJob) sendToSink(events []*pb.ChangeEvent) error {
 
 	_, err = stream.CloseAndRecv()
 	return err
+}
+
+// enrichEventWithSourceID adds _source_id to event data for transform rule matching
+// This is needed because Checkpoint.SourceType may be lost during gRPC transmission
+func (j *MultiJob) enrichEventWithSourceID(event *pb.ChangeEvent) {
+	if event.Data == "" {
+		return
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(event.Data), &data); err != nil {
+		return
+	}
+	// Only add _source_id if not already present
+	if _, exists := data["_source_id"]; !exists {
+		data["_source_id"] = j.SourceID
+		if enrichedData, err := json.Marshal(data); err == nil {
+			event.Data = string(enrichedData)
+		}
+	}
 }
 
 // updateCheckpoint updates job checkpoint
@@ -1088,6 +1171,17 @@ func (j *MultiJob) processSnapshotChunk(chunk *pb.SnapshotChunk, tableName strin
 			continue
 		}
 
+		// Add table name and source_id to record data for transform engine to match rules
+		recordData["_table"] = tableName
+		recordData["_source_id"] = j.SourceID
+
+		// Re-serialize the record with table name and source_id included
+		enrichedRecord, err := json.Marshal(recordData)
+		if err != nil {
+			log.Printf("MultiJob '%s': Failed to re-serialize record from table '%s': %v", j.ID, tableName, err)
+			continue
+		}
+
 		// Extract primary key - check common primary key field names
 		primaryKey := "unknown"
 		// MongoDB uses _id, MySQL/PostgreSQL typically use id
@@ -1101,8 +1195,9 @@ func (j *MultiJob) processSnapshotChunk(chunk *pb.SnapshotChunk, tableName strin
 		event := &pb.ChangeEvent{
 			Op:         "INSERT", // Snapshot data is treated as INSERT
 			PrimaryKey: primaryKey,
-			Data:       record,
+			Data:       string(enrichedRecord), // Use enriched record with _table field
 			Checkpoint: &pb.Checkpoint{
+				SourceType:      j.SourceID, // Set source ID for transform rule matching
 				MysqlBinlogFile: chunk.SnapshotBinlogFile,
 				MysqlBinlogPos:  chunk.SnapshotBinlogPos,
 			},

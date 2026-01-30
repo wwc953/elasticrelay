@@ -112,13 +112,28 @@ func (e *Engine) Transform(ctx context.Context, event *pb.ChangeEvent) (*pb.Chan
 
 	// Extract table name from data
 	tableName := e.extractTableName(data)
-	sourceType := ""
-	if event.Checkpoint != nil {
+	// Extract source_id from data first (more reliable), fallback to Checkpoint
+	sourceType := e.extractSourceID(data)
+	if sourceType == "" && event.Checkpoint != nil {
 		sourceType = event.Checkpoint.SourceType
+	}
+
+	// Debug: Log extracted table name (first few events only to avoid log spam)
+	if e.stats.ProcessedCount < 5 {
+		log.Printf("Transform: Extracted table='%s', sourceType='%s', PK='%s'", tableName, sourceType, event.PrimaryKey)
 	}
 
 	// Match and apply rules
 	matchedRules := e.matchRules(tableName, sourceType)
+
+	// Debug: Log matched rules count
+	if e.stats.ProcessedCount < 5 {
+		ruleIDs := make([]string, len(matchedRules))
+		for i, r := range matchedRules {
+			ruleIDs[i] = r.ID
+		}
+		log.Printf("Transform: Table='%s' matched %d rules: %v", tableName, len(matchedRules), ruleIDs)
+	}
 
 	// If no rules match, pass through unchanged
 	if len(matchedRules) == 0 {
@@ -169,6 +184,14 @@ func (e *Engine) extractTableName(data map[string]interface{}) string {
 		if val, ok := data[field].(string); ok && val != "" {
 			return val
 		}
+	}
+	return ""
+}
+
+// extractSourceID extracts the source_id from event data.
+func (e *Engine) extractSourceID(data map[string]interface{}) string {
+	if val, ok := data["_source_id"].(string); ok && val != "" {
+		return val
 	}
 	return ""
 }

@@ -221,13 +221,22 @@ func (h *eventHandler) handleRowsEvent(header *replication.EventHeader, table *r
 					// Try datetime parsing first for potential datetime fields
 					if parsed, ok := tryParseDateTime(s); ok {
 						dataMap[colName] = parsed
-					} else if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-						dataMap[colName] = i
-					} else if f, err := strconv.ParseFloat(s, 64); err == nil {
-						dataMap[colName] = f
-					} else if b, err := strconv.ParseBool(s); err == nil {
-						dataMap[colName] = b
+					} else if len(s) <= 10 {
+						// Only convert to number if string is short enough to avoid precision issues
+						// This prevents phone numbers (11 digits), ID cards (18 digits), bank cards (16-19 digits)
+						// from being converted to numbers and losing precision in JSON
+						if num, err := strconv.ParseInt(s, 10, 64); err == nil {
+							dataMap[colName] = num
+						} else if f, err := strconv.ParseFloat(s, 64); err == nil {
+							dataMap[colName] = f
+						} else if b, err := strconv.ParseBool(s); err == nil {
+							dataMap[colName] = b
+						} else {
+							dataMap[colName] = s
+						}
 					} else {
+						// For long numeric strings (phone, ID card, bank card), keep as string
+						// to avoid precision loss in JSON serialization
 						// Ensure strings are properly handled as UTF-8
 						if !utf8.Valid(v) {
 							log.Printf("Invalid UTF-8 data in column %s, attempting to fix", colName)
@@ -419,13 +428,22 @@ func (s *Server) BeginSnapshot(req *pb.BeginSnapshotRequest, stream pb.Connector
 					// Try datetime parsing first for potential datetime fields
 					if parsed, ok := tryParseDateTime(s); ok {
 						dataMap[colName] = parsed
-					} else if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-						dataMap[colName] = i
-					} else if f, err := strconv.ParseFloat(s, 64); err == nil {
-						dataMap[colName] = f
-					} else if b, err := strconv.ParseBool(s); err == nil {
-						dataMap[colName] = b
+					} else if len(s) <= 10 {
+						// Only convert to number if string is short enough to avoid precision issues
+						// This prevents phone numbers (11 digits), ID cards (18 digits), bank cards (16-19 digits)
+						// from being converted to numbers and losing precision in JSON
+						if num, err := strconv.ParseInt(s, 10, 64); err == nil {
+							dataMap[colName] = num
+						} else if f, err := strconv.ParseFloat(s, 64); err == nil {
+							dataMap[colName] = f
+						} else if b, err := strconv.ParseBool(s); err == nil {
+							dataMap[colName] = b
+						} else {
+							dataMap[colName] = s
+						}
 					} else {
+						// For long numeric strings (phone, ID card, bank card), keep as string
+						// to avoid precision loss in JSON serialization
 						// Ensure strings are properly handled as UTF-8
 						if !utf8.Valid(v) {
 							log.Printf("Invalid UTF-8 data in column %s, attempting to fix", colName)

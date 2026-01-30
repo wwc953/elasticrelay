@@ -1,0 +1,661 @@
+{
+  "$schema": "Transform配置示例",
+  "$version": "1.0",
+  "$description": "ElasticRelay Transform引擎配置示例，包含字段映射、类型转换、脱敏和表达式计算等功能",
+
+  "transform_rules": [
+    {
+      "id": "user-data-transform",
+      "name": "用户数据转换规则",
+      "description": "用户表数据转换，包含脱敏和字段映射",
+      "source_id": "mysql-main",
+      "table_patterns": ["users", "user_profiles"],
+      "enabled": true,
+      "priority": 1,
+
+      "field_mappings": [
+        {
+          "source_field": "user_name",
+          "target_field": "username",
+          "action": "rename"
+        },
+        {
+          "source_field": "created_at",
+          "target_field": "create_time",
+          "action": "copy"
+        },
+        {
+          "source_field": "updated_at",
+          "target_field": "update_time",
+          "action": "rename"
+        }
+      ],
+
+      "field_configs": [
+        {
+          "field": "age",
+          "target_type": "int",
+          "required": false,
+          "default_value": 0,
+          "null_strategy": "default"
+        },
+        {
+          "field": "email",
+          "target_type": "keyword",
+          "required": true,
+          "validation": {
+            "pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$",
+            "error_message": "Invalid email format"
+          }
+        },
+        {
+          "field": "status",
+          "target_type": "keyword",
+          "required": true,
+          "default_value": "active"
+        },
+        {
+          "field": "balance",
+          "target_type": "float64",
+          "null_strategy": "default",
+          "default_value": 0.0
+        },
+        {
+          "field": "is_vip",
+          "target_type": "bool",
+          "default_value": false
+        },
+        {
+          "field": "internal_notes",
+          "exclude": true
+        },
+        {
+          "field": "debug_info",
+          "exclude": true
+        },
+        {
+          "field": "phone",
+          "target_type": "keyword",
+          "description": "手机号类型为字符串，支持脱敏"
+        },
+        {
+          "field": "id_card",
+          "target_type": "keyword",
+          "description": "身份证类型为字符串，支持脱敏"
+        },
+        {
+          "field": "bank_card",
+          "target_type": "keyword",
+          "description": "银行卡类型为字符串，支持脱敏"
+        },
+        {
+          "field": "password",
+          "target_type": "keyword",
+          "description": "密码类型为字符串，支持哈希"
+        },
+        {
+          "field": "address",
+          "target_type": "text",
+          "description": "地址类型为文本，支持脱敏"
+        }
+      ],
+
+      "masking_rules": [
+        {
+          "field": "phone",
+          "template": "phone",
+          "description": "手机号脱敏: 138****5678"
+        },
+        {
+          "field": "id_card",
+          "template": "id_card",
+          "description": "身份证脱敏: 1234**********5678"
+        },
+        {
+          "field": "email",
+          "template": "email",
+          "description": "邮箱脱敏: ab***@example.com"
+        },
+        {
+          "field": "bank_card",
+          "template": "bank_card",
+          "description": "银行卡脱敏: 6222********1234"
+        },
+        {
+          "field": "password",
+          "strategy": "hash",
+          "params": {
+            "algorithm": "sha256"
+          },
+          "description": "密码SHA256哈希"
+        },
+        {
+          "field": "address",
+          "strategy": "mask",
+          "params": {
+            "prefix": 6,
+            "suffix": 0,
+            "char": "*"
+          },
+          "description": "地址部分脱敏"
+        }
+      ],
+
+      "computed_fields": [
+        {
+          "field": "full_name",
+          "expression": "concat($.last_name, $.first_name)",
+          "dependencies": ["first_name", "last_name"],
+          "description": "拼接中文姓名 (姓+名)"
+        },
+        {
+          "field": "age_group",
+          "expression": "$.age < 18 ? 'minor' : ($.age < 60 ? 'adult' : 'senior')",
+          "dependencies": ["age"],
+          "description": "年龄分组"
+        },
+        {
+          "field": "processed_at",
+          "expression": "now()",
+          "description": "处理时间戳"
+        },
+        {
+          "field": "display_balance",
+          "expression": "round($.balance, 2)",
+          "dependencies": ["balance"],
+          "description": "格式化余额"
+        }
+      ],
+
+      "filters": [
+        {
+          "field": "status",
+          "operator": "ne",
+          "value": "deleted",
+          "action": "include",
+          "description": "排除已删除记录"
+        },
+        {
+          "field": "is_test",
+          "operator": "ne",
+          "value": 1,
+          "action": "include",
+          "description": "排除测试账号 (MySQL中is_test=1表示测试账号)"
+        }
+      ]
+    },
+
+    {
+      "id": "order-data-transform",
+      "name": "订单数据转换规则",
+      "description": "订单表数据转换",
+      "source_id": "mysql-main",
+      "table_patterns": ["orders", "order_items"],
+      "enabled": true,
+      "priority": 2,
+
+      "field_mappings": [
+        {
+          "source_field": "order_no",
+          "target_field": "order_number",
+          "action": "copy"
+        }
+      ],
+
+      "field_configs": [
+        {
+          "field": "amount",
+          "target_type": "float64",
+          "required": true
+        },
+        {
+          "field": "quantity",
+          "target_type": "int",
+          "default_value": 1
+        },
+        {
+          "field": "order_date",
+          "target_type": "date"
+        },
+        {
+          "field": "status",
+          "target_type": "keyword"
+        }
+      ],
+
+      "computed_fields": [
+        {
+          "field": "total_amount",
+          "expression": "$.amount * $.quantity",
+          "dependencies": ["amount", "quantity"]
+        },
+        {
+          "field": "order_year",
+          "expression": "new Date($.order_date).getFullYear()",
+          "dependencies": ["order_date"]
+        }
+      ],
+
+      "filters": [
+        {
+          "field": "status",
+          "operator": "nin",
+          "value": ["cancelled", "refunded"],
+          "action": "include"
+        }
+      ]
+    },
+
+    {
+      "id": "log-data-transform",
+      "name": "日志数据转换规则",
+      "description": "日志表数据转换，简化处理",
+      "source_id": "mysql-main",
+      "table_patterns": ["logs", "audit_logs", "*_log"],
+      "enabled": true,
+      "priority": 10,
+
+      "field_configs": [
+        {
+          "field": "timestamp",
+          "target_type": "date"
+        },
+        {
+          "field": "level",
+          "target_type": "keyword"
+        },
+        {
+          "field": "message",
+          "target_type": "text"
+        },
+        {
+          "field": "request_body",
+          "exclude": true
+        },
+        {
+          "field": "response_body",
+          "exclude": true
+        }
+      ],
+
+      "masking_rules": [
+        {
+          "field": "user_ip",
+          "strategy": "mask",
+          "params": {
+            "prefix": 0,
+            "suffix": 0,
+            "char": "*"
+          }
+        }
+      ]
+    },
+
+    {
+      "id": "mongodb-doc-transform",
+      "name": "MongoDB文档转换规则",
+      "description": "MongoDB集合数据转换",
+      "source_id": "mongodb-main",
+      "table_patterns": ["products", "categories"],
+      "enabled": true,
+      "priority": 5,
+
+      "field_mappings": [
+        {
+          "source_field": "_id",
+          "target_field": "mongo_id",
+          "action": "copy"
+        }
+      ],
+
+      "field_configs": [
+        {
+          "field": "price",
+          "target_type": "float64"
+        },
+        {
+          "field": "stock",
+          "target_type": "int",
+          "default_value": 0
+        },
+        {
+          "field": "tags",
+          "target_type": "keyword"
+        }
+      ],
+
+      "computed_fields": [
+        {
+          "field": "in_stock",
+          "expression": "$.stock > 0"
+        },
+        {
+          "field": "price_tier",
+          "expression": "$.price < 100 ? 'low' : ($.price < 500 ? 'medium' : 'high')"
+        }
+      ]
+    },
+
+    {
+      "id": "mysql-users-transform",
+      "name": "MySQL用户表转换规则",
+      "description": "mysql_users表数据转换，用于CDC测试",
+      "source_id": "mysql-main",
+      "table_patterns": ["mysql_users"],
+      "enabled": true,
+      "priority": 3,
+
+      "field_mappings": [
+        {
+          "source_field": "username",
+          "target_field": "user_name",
+          "action": "copy"
+        },
+        {
+          "source_field": "created_at",
+          "target_field": "create_time",
+          "action": "copy"
+        },
+        {
+          "source_field": "updated_at",
+          "target_field": "update_time",
+          "action": "rename"
+        }
+      ],
+
+      "field_configs": [
+        {
+          "field": "email",
+          "target_type": "keyword",
+          "required": true
+        },
+        {
+          "field": "first_name",
+          "target_type": "keyword"
+        },
+        {
+          "field": "last_name",
+          "target_type": "keyword"
+        },
+        {
+          "field": "is_verified",
+          "target_type": "bool",
+          "default_value": false
+        },
+        {
+          "field": "profile",
+          "target_type": "object",
+          "description": "JSON字段保持对象类型"
+        }
+      ],
+
+      "masking_rules": [
+        {
+          "field": "phone",
+          "template": "phone",
+          "description": "手机号脱敏: 138****5678"
+        },
+        {
+          "field": "email",
+          "template": "email",
+          "description": "邮箱脱敏: ab***@example.com"
+        }
+      ],
+
+      "computed_fields": [
+        {
+          "field": "full_name",
+          "expression": "concat($.first_name || '', ' ', $.last_name || '')",
+          "dependencies": ["first_name", "last_name"],
+          "description": "拼接姓名"
+        },
+        {
+          "field": "processed_at",
+          "expression": "now()",
+          "description": "处理时间戳"
+        }
+      ]
+    },
+
+    {
+      "id": "mysql-orders-transform",
+      "name": "MySQL订单表转换规则",
+      "description": "mysql_orders表数据转换，用于CDC测试",
+      "source_id": "mysql-main",
+      "table_patterns": ["mysql_orders"],
+      "enabled": true,
+      "priority": 4,
+
+      "field_mappings": [
+        {
+          "source_field": "order_number",
+          "target_field": "order_no",
+          "action": "copy"
+        }
+      ],
+
+      "field_configs": [
+        {
+          "field": "total_amount",
+          "target_type": "float64",
+          "required": true
+        },
+        {
+          "field": "status",
+          "target_type": "keyword"
+        },
+        {
+          "field": "order_data",
+          "target_type": "object",
+          "description": "订单详情JSON"
+        },
+        {
+          "field": "shipping_address",
+          "target_type": "text"
+        }
+      ],
+
+      "masking_rules": [
+        {
+          "field": "shipping_address",
+          "strategy": "mask",
+          "params": {
+            "prefix": 6,
+            "suffix": 0,
+            "char": "*"
+          },
+          "description": "收货地址部分脱敏"
+        }
+      ],
+
+      "computed_fields": [
+        {
+          "field": "is_completed",
+          "expression": "$.status == 'delivered'",
+          "dependencies": ["status"],
+          "description": "是否已完成"
+        },
+        {
+          "field": "processed_at",
+          "expression": "now()",
+          "description": "处理时间戳"
+        }
+      ],
+
+      "filters": [
+        {
+          "field": "status",
+          "operator": "ne",
+          "value": "cancelled",
+          "action": "include",
+          "description": "排除已取消订单"
+        }
+      ]
+    },
+
+    {
+      "id": "mysql-products-transform",
+      "name": "MySQL产品表转换规则",
+      "description": "mysql_products表数据转换，用于CDC测试",
+      "source_id": "mysql-main",
+      "table_patterns": ["mysql_products"],
+      "enabled": true,
+      "priority": 5,
+
+      "field_configs": [
+        {
+          "field": "sku",
+          "target_type": "keyword",
+          "required": true
+        },
+        {
+          "field": "name",
+          "target_type": "text"
+        },
+        {
+          "field": "description",
+          "target_type": "text"
+        },
+        {
+          "field": "price",
+          "target_type": "float64",
+          "required": true
+        },
+        {
+          "field": "category",
+          "target_type": "keyword"
+        },
+        {
+          "field": "specifications",
+          "target_type": "object"
+        },
+        {
+          "field": "in_stock",
+          "target_type": "bool"
+        },
+        {
+          "field": "stock_quantity",
+          "target_type": "int",
+          "default_value": 0
+        }
+      ],
+
+      "computed_fields": [
+        {
+          "field": "price_tier",
+          "expression": "$.price < 1000 ? 'budget' : ($.price < 5000 ? 'mid-range' : 'premium')",
+          "dependencies": ["price"],
+          "description": "价格分级"
+        },
+        {
+          "field": "availability",
+          "expression": "$.in_stock && $.stock_quantity > 0 ? 'available' : 'out_of_stock'",
+          "dependencies": ["in_stock", "stock_quantity"],
+          "description": "库存状态"
+        }
+      ]
+    },
+
+    {
+      "id": "test-table-transform",
+      "name": "测试表转换规则",
+      "description": "test_table通用测试转换",
+      "source_id": "mysql-main",
+      "table_patterns": ["test_table"],
+      "enabled": true,
+      "priority": 100,
+
+      "field_configs": [
+        {
+          "field": "name",
+          "target_type": "text"
+        },
+        {
+          "field": "email",
+          "target_type": "keyword"
+        },
+        {
+          "field": "age",
+          "target_type": "int"
+        },
+        {
+          "field": "metadata",
+          "target_type": "object"
+        },
+        {
+          "field": "is_active",
+          "target_type": "bool",
+          "default_value": true
+        }
+      ],
+
+      "masking_rules": [
+        {
+          "field": "email",
+          "template": "email",
+          "description": "邮箱脱敏"
+        }
+      ],
+
+      "computed_fields": [
+        {
+          "field": "age_group",
+          "expression": "$.age < 18 ? 'minor' : ($.age < 60 ? 'adult' : 'senior')",
+          "dependencies": ["age"],
+          "description": "年龄分组"
+        }
+      ]
+    }
+  ],
+
+  "global_settings": {
+    "default_null_strategy": "ignore",
+    "enable_validation": true,
+    "enable_computed_fields": true,
+    "enable_masking": true,
+    "max_expression_timeout_ms": 100,
+    "cache_compiled_rules": true
+  },
+
+  "masking_templates": {
+    "phone": {
+      "strategy": "mask",
+      "params": {
+        "prefix": 3,
+        "suffix": 4,
+        "char": "*"
+      }
+    },
+    "id_card": {
+      "strategy": "mask",
+      "params": {
+        "prefix": 4,
+        "suffix": 4,
+        "char": "*"
+      }
+    },
+    "email": {
+      "strategy": "regex",
+      "params": {
+        "pattern": "(.{2}).*(@.*)",
+        "replace": "$1***$2"
+      }
+    },
+    "bank_card": {
+      "strategy": "mask",
+      "params": {
+        "prefix": 4,
+        "suffix": 4,
+        "char": "*"
+      }
+    },
+    "name": {
+      "strategy": "mask",
+      "params": {
+        "prefix": 1,
+        "suffix": 0,
+        "char": "*"
+      }
+    }
+  }
+}

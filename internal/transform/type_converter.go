@@ -31,6 +31,7 @@ func NewTypeConverter() *TypeConverter {
 	tc.Register(DataTypeTimestamp, tc.toTimestamp)
 	tc.Register(DataTypeKeyword, tc.toString) // ES keyword type
 	tc.Register(DataTypeText, tc.toString)    // ES text type
+	tc.Register(DataTypeObject, tc.toObject)  // JSON object type (pass-through)
 
 	return tc
 }
@@ -89,6 +90,12 @@ func (tc *TypeConverter) toString(value interface{}) (interface{}, error) {
 	default:
 		return fmt.Sprintf("%v", value), nil
 	}
+}
+
+// toObject passes through the value as-is (for JSON object/array fields).
+func (tc *TypeConverter) toObject(value interface{}) (interface{}, error) {
+	// Pass through the value unchanged - it's already a map or slice
+	return value, nil
 }
 
 // toInt converts a value to int.

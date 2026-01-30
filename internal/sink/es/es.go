@@ -124,6 +124,7 @@ func (s *Server) cleanDataForES(jsonData string) string {
 	delete(data, "_collection") // MongoDB collection name
 	delete(data, "_schema")
 	delete(data, "_database")
+	delete(data, "_source_id") // Transform rule matching metadata
 	// Remove _id field from document body - ES uses _id as metadata field
 	// The document ID should be set via DocumentID in the bulk request, not in the body
 	delete(data, "_id")
