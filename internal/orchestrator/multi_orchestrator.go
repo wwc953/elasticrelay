@@ -1124,6 +1124,11 @@ func (j *MultiJob) monitorParallelProgress() error {
 
 // snapshotTable performs snapshot for a single table
 func (j *MultiJob) snapshotTable(connectorClient pb.ConnectorServiceClient, tableName string) error {
+	primaryKeyColumns, err := j.getSnapshotPrimaryKeyColumns(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get primary key columns for table %s: %w", tableName, err)
+	}
+
 	// Start snapshot stream
 	stream, err := connectorClient.BeginSnapshot(j.ctx, &pb.BeginSnapshotRequest{
 		JobId:     j.ID,
@@ -1144,7 +1149,7 @@ func (j *MultiJob) snapshotTable(connectorClient pb.ConnectorServiceClient, tabl
 		}
 
 		// Process snapshot chunk - convert to ChangeEvents and send to sink
-		if err := j.processSnapshotChunk(chunk, tableName); err != nil {
+		if err := j.processSnapshotChunk(chunk, tableName, primaryKeyColumns); err != nil {
 			return fmt.Errorf("failed to process snapshot chunk: %w", err)
 		}
 
@@ -1158,8 +1163,145 @@ func (j *MultiJob) snapshotTable(connectorClient pb.ConnectorServiceClient, tabl
 	return nil
 }
 
+func (j *MultiJob) getSnapshotPrimaryKeyColumns(tableName string) ([]string, error) {
+	if j.connectorInstance == nil || j.connectorInstance.Config == nil {
+		return nil, fmt.Errorf("connector instance or config is nil")
+	}
+
+	switch strings.ToLower(j.connectorInstance.Type) {
+	case "mysql":
+		return j.getMySQLPrimaryKeyColumns(tableName)
+	case "postgresql":
+		return j.getPostgreSQLPrimaryKeyColumns(tableName)
+	case "mongodb":
+		return []string{"_id"}, nil
+	default:
+		return nil, fmt.Errorf("unsupported source type for snapshot primary key lookup: %s", j.connectorInstance.Type)
+	}
+}
+
+func (j *MultiJob) getMySQLPrimaryKeyColumns(tableName string) ([]string, error) {
+	cfg := j.connectorInstance.Config
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&interpolateParams=true&loc=Local",
+		cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Database)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open mysql connection: %w", err)
+	}
+	defer db.Close()
+
+	query := `
+		SELECT COLUMN_NAME
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ?
+		  AND TABLE_NAME = ?
+		  AND COLUMN_KEY = 'PRI'
+		ORDER BY ORDINAL_POSITION
+	`
+
+	rows, err := db.QueryContext(j.ctx, query, cfg.Database, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query mysql primary key metadata: %w", err)
+	}
+	defer rows.Close()
+
+	var pkColumns []string
+	for rows.Next() {
+		var columnName string
+		if err := rows.Scan(&columnName); err != nil {
+			return nil, fmt.Errorf("failed to scan mysql primary key column: %w", err)
+		}
+		pkColumns = append(pkColumns, columnName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate mysql primary key rows: %w", err)
+	}
+
+	if len(pkColumns) == 0 {
+		return nil, fmt.Errorf("table %s has no primary key", tableName)
+	}
+
+	return pkColumns, nil
+}
+
+func (j *MultiJob) getPostgreSQLPrimaryKeyColumns(tableName string) ([]string, error) {
+	cfg := j.connectorInstance.Config
+	schemaName := "public"
+	baseTableName := tableName
+	if strings.Contains(tableName, ".") {
+		parts := strings.SplitN(tableName, ".", 2)
+		schemaName = parts[0]
+		baseTableName = parts[1]
+	}
+
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Database)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open postgresql connection: %w", err)
+	}
+	defer db.Close()
+
+	query := `
+		SELECT kcu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+		  ON tc.constraint_name = kcu.constraint_name
+		 AND tc.table_schema = kcu.table_schema
+		WHERE tc.constraint_type = 'PRIMARY KEY'
+		  AND tc.table_schema = $1
+		  AND tc.table_name = $2
+		ORDER BY kcu.ordinal_position
+	`
+
+	rows, err := db.QueryContext(j.ctx, query, schemaName, baseTableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query postgresql primary key metadata: %w", err)
+	}
+	defer rows.Close()
+
+	var pkColumns []string
+	for rows.Next() {
+		var columnName string
+		if err := rows.Scan(&columnName); err != nil {
+			return nil, fmt.Errorf("failed to scan postgresql primary key column: %w", err)
+		}
+		pkColumns = append(pkColumns, columnName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate postgresql primary key rows: %w", err)
+	}
+
+	if len(pkColumns) == 0 {
+		return nil, fmt.Errorf("table %s has no primary key", tableName)
+	}
+
+	return pkColumns, nil
+}
+
+func extractSnapshotPrimaryKey(recordData map[string]interface{}, primaryKeyColumns []string) (string, error) {
+	if len(primaryKeyColumns) == 0 {
+		return "", fmt.Errorf("no primary key columns configured")
+	}
+
+	pkParts := make([]string, 0, len(primaryKeyColumns))
+	for _, columnName := range primaryKeyColumns {
+		value, exists := recordData[columnName]
+		if !exists {
+			return "", fmt.Errorf("primary key column %s not found in snapshot record", columnName)
+		}
+		pkParts = append(pkParts, fmt.Sprintf("%v", value))
+	}
+
+	return strings.Join(pkParts, ":"), nil
+}
+
 // processSnapshotChunk converts snapshot data to ChangeEvents and sends to sink
-func (j *MultiJob) processSnapshotChunk(chunk *pb.SnapshotChunk, tableName string) error {
+func (j *MultiJob) processSnapshotChunk(chunk *pb.SnapshotChunk, tableName string, primaryKeyColumns []string) error {
 	events := make([]*pb.ChangeEvent, 0, len(chunk.Records))
 
 	// Convert snapshot records to ChangeEvents
@@ -1182,13 +1324,10 @@ func (j *MultiJob) processSnapshotChunk(chunk *pb.SnapshotChunk, tableName strin
 			continue
 		}
 
-		// Extract primary key - check common primary key field names
-		primaryKey := "unknown"
-		// MongoDB uses _id, MySQL/PostgreSQL typically use id
-		if id, exists := recordData["_id"]; exists {
-			primaryKey = fmt.Sprintf("%v", id)
-		} else if id, exists := recordData["id"]; exists {
-			primaryKey = fmt.Sprintf("%v", id)
+		primaryKey, err := extractSnapshotPrimaryKey(recordData, primaryKeyColumns)
+		if err != nil {
+			log.Printf("MultiJob '%s': Failed to extract primary key from table '%s': %v", j.ID, tableName, err)
+			continue
 		}
 
 		// Create ChangeEvent for snapshot data

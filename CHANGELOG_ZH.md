@@ -1,5 +1,74 @@
 # ElasticRelay 修改日志
 
+## [v1.4.3] - 2026-03-10
+
+### 🔧 快照主键提取修复
+
+此版本修复了一个快照同步问题：当表使用非标准主键字段名时，写入 Elasticsearch 的文档 ID 可能会变成 `"unknown"`，从而导致多条记录相互覆盖。
+
+### 🐛 问题修复
+
+#### 1. 多数据源快照主键解析修复 (`internal/orchestrator/multi_orchestrator.go`)
+
+**修复快照链路使用硬编码主键字段名的问题：**
+
+- **问题：** 快照记录在构建 `ChangeEvent.PrimaryKey` 时，只检查 `_id` 和 `id`
+- **根本原因：** 快照转换逻辑通过猜测常见字段名来提取主键，而不是查询表的真实主键元数据
+- **修复：** 为 MySQL、PostgreSQL 和 MongoDB 快照源增加自动主键发现逻辑，再根据真实主键列提取主键值
+- **影响：** 使用 `info_id`、`user_code`、`order_no` 等自定义主键名，或使用联合主键的表，在初始同步期间都可以生成正确的 Elasticsearch 文档 ID
+
+```go
+primaryKeyColumns, err := j.getSnapshotPrimaryKeyColumns(tableName)
+if err != nil {
+    return fmt.Errorf("failed to get primary key columns for table %s: %w", tableName, err)
+}
+
+primaryKey, err := extractSnapshotPrimaryKey(recordData, primaryKeyColumns)
+if err != nil {
+    log.Printf("Failed to extract primary key: %v", err)
+    continue
+}
+```
+
+#### 2. 并行快照主键列透传修复 (`internal/parallel/manager.go`, `internal/parallel/worker.go`, `internal/parallel/types.go`)
+
+**修复并行快照链路默认使用 `id` 的问题：**
+
+- **问题：** 并行快照 worker 仍然通过 `data["id"]` 提取文档 ID，当表的主键列名不是 `id` 时会失败
+- **修复：** 将已发现的主键列通过 `TableTask` 和 `ChunkTask` 一路向下传递，并在构建查询和提取记录 ID 时使用真实主键列
+- **影响：** 并行快照模式现在与串行快照路径保持一致，支持任意单列主键字段名
+
+```go
+task.PrimaryKeyColumn = indexInfo.PrimaryKeyColumn
+
+record, err := w.scanRow(rows, columns, chunk.TableTask.TableName, chunk.TableTask.PrimaryKeyColumn)
+
+primaryKey, err := extractRecordPrimaryKey(data, primaryKeyColumn)
+```
+
+#### 3. 非自增主键快照回退策略 (`internal/parallel/manager.go`, `internal/parallel/worker.go`)
+
+**改进非自增主键的处理方式：**
+
+- **问题：** 并行快照分块原本主要针对数值型自增主键优化，无法安全地对其他主键类型做范围切分
+- **修复：** 为存在真实主键但不适合数值范围分块的表增加整表扫描回退分块
+- **影响：** 对于字符串主键等场景，初始同步结果仍然正确；对于自增数值主键表，则继续使用优化后的分块方式
+
+### ✅ 验证
+
+修复后：
+
+- 主键名为 `id` 的表继续保持正常同步
+- 主键名为 `info_id` 或其他自定义字段名的表，会使用真实主键值作为 Elasticsearch `_id`
+- 快照记录不再因为硬编码主键检测而收敛成同一个 `"unknown"` 文档
+
+已执行验证：
+
+- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/parallel/types.go internal/parallel/manager.go internal/parallel/worker.go`
+- `go test ./internal/orchestrator ./internal/parallel`
+
+---
+
 ## [v1.3.1] - 2025-12-15
 
 ### 🐛 问题修复

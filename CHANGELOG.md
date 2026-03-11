@@ -1,5 +1,74 @@
 # ElasticRelay Changelog
 
+## [v1.4.3] - 2026-03-10
+
+### 🔧 Snapshot Primary Key Extraction Fix
+
+This release fixes a snapshot synchronization bug where tables with non-standard primary key names could be written to Elasticsearch with document ID `"unknown"`, causing multiple records to overwrite each other.
+
+### 🐛 Bug Fixes
+
+#### 1. Multi-Source Snapshot PK Resolution (`internal/orchestrator/multi_orchestrator.go`)
+
+**Fixed snapshot path using hardcoded primary key field names:**
+
+- **Issue**: Snapshot records only checked `_id` and `id` when building `ChangeEvent.PrimaryKey`
+- **Root Cause**: The snapshot conversion logic guessed common field names instead of querying the table's actual primary key metadata
+- **Fix**: Added automatic primary key discovery for MySQL, PostgreSQL, and MongoDB snapshot sources, then extracted the primary key from the real PK columns
+- **Impact**: Tables using primary key names such as `info_id`, `user_code`, `order_no`, or composite primary keys now generate correct Elasticsearch document IDs during initial sync
+
+```go
+primaryKeyColumns, err := j.getSnapshotPrimaryKeyColumns(tableName)
+if err != nil {
+    return fmt.Errorf("failed to get primary key columns for table %s: %w", tableName, err)
+}
+
+primaryKey, err := extractSnapshotPrimaryKey(recordData, primaryKeyColumns)
+if err != nil {
+    log.Printf("Failed to extract primary key: %v", err)
+    continue
+}
+```
+
+#### 2. Parallel Snapshot PK Propagation (`internal/parallel/manager.go`, `internal/parallel/worker.go`, `internal/parallel/types.go`)
+
+**Fixed parallel snapshot path defaulting to `id`:**
+
+- **Issue**: Parallel snapshot workers still extracted document IDs from `data["id"]`, which failed for tables whose primary key column used another name
+- **Fix**: Propagated the discovered primary key column through `TableTask` and `ChunkTask`, then used that column when building queries and extracting record IDs
+- **Impact**: Parallel snapshot mode now behaves consistently with the serial snapshot path and supports arbitrary single-column primary key names
+
+```go
+task.PrimaryKeyColumn = indexInfo.PrimaryKeyColumn
+
+record, err := w.scanRow(rows, columns, chunk.TableTask.TableName, chunk.TableTask.PrimaryKeyColumn)
+
+primaryKey, err := extractRecordPrimaryKey(data, primaryKeyColumn)
+```
+
+#### 3. Non-Auto-Increment PK Snapshot Fallback (`internal/parallel/manager.go`, `internal/parallel/worker.go`)
+
+**Improved handling for non-auto-increment primary keys:**
+
+- **Issue**: Parallel snapshot chunking was optimized for numeric auto-increment primary keys and could not safely range-split other primary key types
+- **Fix**: Added a full-table-scan fallback chunk for tables that have a real primary key but are not suitable for numeric range chunking
+- **Impact**: Initial sync remains correct for string-based primary keys, while still using optimized chunking for auto-increment numeric tables
+
+### ✅ Verification
+
+After this fix:
+
+- Tables with primary keys named `id` continue to sync normally
+- Tables with primary keys named `info_id` or other custom names now use the real PK value as Elasticsearch `_id`
+- Snapshot records no longer collapse into a single `"unknown"` document due to hardcoded PK detection
+
+Validation performed:
+
+- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/parallel/types.go internal/parallel/manager.go internal/parallel/worker.go`
+- `go test ./internal/orchestrator ./internal/parallel`
+
+---
+
 ## [v1.4.2] - 2026-01-30
 
 ### 🔧 Transform Rule Matching Fix

@@ -52,33 +52,35 @@ func DefaultSnapshotConfig() *SnapshotConfig {
 
 // TableTask represents a table synchronization task
 type TableTask struct {
-	JobID        string     `json:"job_id"`
-	TableName    string     `json:"table_name"`
-	TotalRows    int64      `json:"total_rows"`
-	ChunkSize    int        `json:"chunk_size"`
-	Priority     int        `json:"priority"`     // Priority (lower for large tables)
-	Dependencies []string   `json:"dependencies"` // Dependent tables (foreign key relationships)
-	Status       TaskStatus `json:"status"`
-	CreatedAt    time.Time  `json:"created_at"`
-	StartedAt    *time.Time `json:"started_at,omitempty"`
-	CompletedAt  *time.Time `json:"completed_at,omitempty"`
-	ErrorMsg     string     `json:"error_msg,omitempty"`
+	JobID            string     `json:"job_id"`
+	TableName        string     `json:"table_name"`
+	PrimaryKeyColumn string     `json:"primary_key_column,omitempty"`
+	TotalRows        int64      `json:"total_rows"`
+	ChunkSize        int        `json:"chunk_size"`
+	Priority         int        `json:"priority"`     // Priority (lower for large tables)
+	Dependencies     []string   `json:"dependencies"` // Dependent tables (foreign key relationships)
+	Status           TaskStatus `json:"status"`
+	CreatedAt        time.Time  `json:"created_at"`
+	StartedAt        *time.Time `json:"started_at,omitempty"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
+	ErrorMsg         string     `json:"error_msg,omitempty"`
 }
 
 // ChunkTask represents a chunk of data to be processed
 type ChunkTask struct {
-	ID            string      `json:"id"` // Unique identifier
-	TableTask     *TableTask  `json:"table_task"`
-	ChunkID       int         `json:"chunk_id"`
-	StartID       int64       `json:"start_id"`    // Starting primary key ID
-	EndID         int64       `json:"end_id"`      // Ending primary key ID
-	RetryCount    int         `json:"retry_count"` // Retry count
-	Status        ChunkStatus `json:"status"`
-	WorkerID      int         `json:"worker_id,omitempty"`
-	StartedAt     *time.Time  `json:"started_at,omitempty"`
-	CompletedAt   *time.Time  `json:"completed_at,omitempty"`
-	ProcessedRows int64       `json:"processed_rows"`
-	ErrorMsg      string      `json:"error_msg,omitempty"`
+	ID               string      `json:"id"` // Unique identifier
+	TableTask        *TableTask  `json:"table_task"`
+	ChunkID          int         `json:"chunk_id"`
+	StartID          int64       `json:"start_id"` // Starting primary key ID
+	EndID            int64       `json:"end_id"`   // Ending primary key ID
+	UseFullTableScan bool        `json:"use_full_table_scan,omitempty"`
+	RetryCount       int         `json:"retry_count"` // Retry count
+	Status           ChunkStatus `json:"status"`
+	WorkerID         int         `json:"worker_id,omitempty"`
+	StartedAt        *time.Time  `json:"started_at,omitempty"`
+	CompletedAt      *time.Time  `json:"completed_at,omitempty"`
+	ProcessedRows    int64       `json:"processed_rows"`
+	ErrorMsg         string      `json:"error_msg,omitempty"`
 }
 
 // IndexInfo contains information about table indexes

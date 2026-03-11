@@ -63,8 +63,12 @@ func (w *SnapshotWorker) processChunk(ctx context.Context, chunk *ChunkTask) {
 	// Update chunk status
 	w.updateChunkStatus(chunk, ChunkStatusRunning)
 
-	log.Printf("Worker #%d processing chunk %s (ID range: %d-%d)",
-		w.ID, chunk.ID, chunk.StartID, chunk.EndID)
+	if chunk.UseFullTableScan {
+		log.Printf("Worker #%d processing chunk %s (full table scan)", w.ID, chunk.ID)
+	} else {
+		log.Printf("Worker #%d processing chunk %s (PK range: %d-%d)",
+			w.ID, chunk.ID, chunk.StartID, chunk.EndID)
+	}
 
 	err := w.doProcessChunk(ctx, chunk)
 
@@ -109,7 +113,7 @@ func (w *SnapshotWorker) doProcessChunk(ctx context.Context, chunk *ChunkTask) e
 
 	for rows.Next() {
 		// Scan row data
-		record, err := w.scanRow(rows, columns, chunk.TableTask.TableName)
+		record, err := w.scanRow(rows, columns, chunk.TableTask.TableName, chunk.TableTask.PrimaryKeyColumn)
 		if err != nil {
 			log.Printf("scan row error: %v", err)
 			continue
@@ -150,17 +154,28 @@ func (w *SnapshotWorker) doProcessChunk(ctx context.Context, chunk *ChunkTask) e
 // buildChunkQuery builds the SQL query for a chunk
 func (w *SnapshotWorker) buildChunkQuery(chunk *ChunkTask) string {
 	table := chunk.TableTask.TableName
+	primaryKeyColumn := chunk.TableTask.PrimaryKeyColumn
+
+	if chunk.UseFullTableScan {
+		if primaryKeyColumn == "" {
+			return fmt.Sprintf("SELECT * FROM %s", table)
+		}
+		return fmt.Sprintf(`
+		SELECT * FROM %s
+		ORDER BY %s
+	`, table, primaryKeyColumn)
+	}
 
 	// Use primary key range-based query with index optimization
 	return fmt.Sprintf(`
 		SELECT * FROM %s 
-		WHERE id >= %d AND id < %d 
-		ORDER BY id
-	`, table, chunk.StartID, chunk.EndID)
+		WHERE %s >= %d AND %s < %d 
+		ORDER BY %s
+	`, table, primaryKeyColumn, chunk.StartID, primaryKeyColumn, chunk.EndID, primaryKeyColumn)
 }
 
 // scanRow scans a database row into a Record
-func (w *SnapshotWorker) scanRow(rows *sql.Rows, columns []string, tableName string) (*Record, error) {
+func (w *SnapshotWorker) scanRow(rows *sql.Rows, columns []string, tableName string, primaryKeyColumn string) (*Record, error) {
 	values := make([]interface{}, len(columns))
 	valuePtrs := make([]interface{}, len(columns))
 
@@ -187,10 +202,9 @@ func (w *SnapshotWorker) scanRow(rows *sql.Rows, columns []string, tableName str
 		}
 	}
 
-	// Extract primary key
-	primaryKey := "unknown"
-	if id, exists := data["id"]; exists {
-		primaryKey = fmt.Sprintf("%v", id)
+	primaryKey, err := extractRecordPrimaryKey(data, primaryKeyColumn)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Record{
@@ -199,6 +213,19 @@ func (w *SnapshotWorker) scanRow(rows *sql.Rows, columns []string, tableName str
 		Data:      data,
 		Timestamp: time.Now(),
 	}, nil
+}
+
+func extractRecordPrimaryKey(data map[string]interface{}, primaryKeyColumn string) (string, error) {
+	if primaryKeyColumn == "" {
+		return "", fmt.Errorf("primary key column is not configured")
+	}
+
+	value, exists := data[primaryKeyColumn]
+	if !exists {
+		return "", fmt.Errorf("primary key column %s not found in row data", primaryKeyColumn)
+	}
+
+	return fmt.Sprintf("%v", value), nil
 }
 
 // convertValue converts database values to appropriate types

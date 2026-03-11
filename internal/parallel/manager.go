@@ -203,13 +203,19 @@ func (m *ParallelSnapshotManager) createTableChunks(task *TableTask) ([]*ChunkTa
 		return nil, fmt.Errorf("failed to analyze indexes: %w", err)
 	}
 
+	if indexInfo.PrimaryKeyColumn == "" {
+		return nil, fmt.Errorf("table %s has no primary key", task.TableName)
+	}
+
+	task.PrimaryKeyColumn = indexInfo.PrimaryKeyColumn
+
 	var chunks []*ChunkTask
 
 	// Use ID-based chunking strategy
 	if indexInfo.HasAutoIncrementPK {
 		chunks, err = m.createIDBasedChunks(task, indexInfo)
 	} else {
-		return nil, fmt.Errorf("table %s has no suitable index for chunking", task.TableName)
+		chunks = m.createFullTableChunk(task)
 	}
 
 	if err != nil {
@@ -217,6 +223,18 @@ func (m *ParallelSnapshotManager) createTableChunks(task *TableTask) ([]*ChunkTa
 	}
 
 	return chunks, nil
+}
+
+func (m *ParallelSnapshotManager) createFullTableChunk(task *TableTask) []*ChunkTask {
+	return []*ChunkTask{
+		{
+			ID:               fmt.Sprintf("%s_chunk_0", task.TableName),
+			TableTask:        task,
+			ChunkID:          0,
+			UseFullTableScan: true,
+			Status:           ChunkStatusPending,
+		},
+	}
 }
 
 // createIDBasedChunks creates chunks based on primary key ID ranges
@@ -317,12 +335,6 @@ func (m *ParallelSnapshotManager) analyzeTableIndexes(tableName string) (*IndexI
 			}
 			break
 		}
-	}
-
-	// If no primary key found, assume 'id' column exists
-	if indexInfo.PrimaryKeyColumn == "" {
-		indexInfo.PrimaryKeyColumn = "id"
-		indexInfo.HasAutoIncrementPK = true
 	}
 
 	return indexInfo, nil
