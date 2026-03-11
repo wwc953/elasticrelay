@@ -417,6 +417,18 @@ func (j *MultiJob) startCDC() {
 		job: j,
 	}
 
+	var startCheckpoint *pb.Checkpoint
+	if strings.EqualFold(j.connectorInstance.Type, "postgresql") {
+		j.cpMutex.RLock()
+		startCheckpoint = j.lastCp
+		j.cpMutex.RUnlock()
+		if startCheckpoint != nil && startCheckpoint.PostgresLsn != "" {
+			log.Printf("MultiJob '%s': Reusing PostgreSQL checkpoint for CDC start: %s", j.ID, startCheckpoint.PostgresLsn)
+		} else {
+			startCheckpoint = nil
+		}
+	}
+
 	// Handle different connector types
 	switch connector := j.connectorInstance.Connector.(type) {
 	case *mysql.Connector:
@@ -427,7 +439,7 @@ func (j *MultiJob) startCDC() {
 		}
 	case *postgresql.Connector:
 		log.Printf("MultiJob '%s': Starting PostgreSQL CDC stream", j.ID)
-		err := connector.Start(stream, nil)
+		err := connector.Start(stream, startCheckpoint)
 		if err != nil {
 			log.Printf("MultiJob '%s': PostgreSQL CDC error: %v", j.ID, err)
 		}
@@ -715,9 +727,28 @@ func (j *MultiJob) commitCheckpoint() {
 	if err != nil {
 		log.Printf("MultiJob '%s': Failed to commit checkpoint: %v", j.ID, err)
 	} else {
-		log.Printf("MultiJob '%s': Successfully committed checkpoint at %s:%d",
-			j.ID, j.lastCp.MysqlBinlogFile, j.lastCp.MysqlBinlogPos)
+		log.Printf("MultiJob '%s': Successfully committed checkpoint at %s",
+			j.ID, j.formatCheckpointPosition(j.lastCp))
 	}
+}
+
+func (j *MultiJob) formatCheckpointPosition(cp *pb.Checkpoint) string {
+	if cp == nil {
+		return "<nil>"
+	}
+	if cp.PostgresLsn != "" {
+		return cp.PostgresLsn
+	}
+	if cp.MysqlBinlogFile != "" || cp.MysqlBinlogPos > 0 {
+		return fmt.Sprintf("%s:%d", cp.MysqlBinlogFile, cp.MysqlBinlogPos)
+	}
+	if cp.MongoResumeToken != "" {
+		return cp.MongoResumeToken
+	}
+	if cp.Position != "" {
+		return cp.Position
+	}
+	return "<empty>"
 }
 
 // needsInitialSync checks if initial sync is needed for this job using multiple criteria
@@ -1331,15 +1362,27 @@ func (j *MultiJob) processSnapshotChunk(chunk *pb.SnapshotChunk, tableName strin
 		}
 
 		// Create ChangeEvent for snapshot data
+		checkpoint := &pb.Checkpoint{
+			SourceType: j.SourceID, // Preserve source ID for transform rule matching
+		}
+		if strings.EqualFold(j.connectorInstance.Type, "postgresql") {
+			snapshotLSN := chunk.Cursor
+			if snapshotLSN == "" {
+				snapshotLSN = chunk.SnapshotBinlogFile
+			}
+			checkpoint.Position = snapshotLSN
+			checkpoint.PostgresLsn = snapshotLSN
+			checkpoint.Timestamp = time.Now().Unix()
+		} else {
+			checkpoint.MysqlBinlogFile = chunk.SnapshotBinlogFile
+			checkpoint.MysqlBinlogPos = chunk.SnapshotBinlogPos
+		}
+
 		event := &pb.ChangeEvent{
 			Op:         "INSERT", // Snapshot data is treated as INSERT
 			PrimaryKey: primaryKey,
 			Data:       string(enrichedRecord), // Use enriched record with _table field
-			Checkpoint: &pb.Checkpoint{
-				SourceType:      j.SourceID, // Set source ID for transform rule matching
-				MysqlBinlogFile: chunk.SnapshotBinlogFile,
-				MysqlBinlogPos:  chunk.SnapshotBinlogPos,
-			},
+			Checkpoint: checkpoint,
 		}
 
 		events = append(events, event)

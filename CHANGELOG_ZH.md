@@ -1,5 +1,57 @@
 # ElasticRelay 修改日志
 
+## [v1.4.4] - 2026-03-11
+
+### 🔧 PostgreSQL 快照到 CDC 衔接修复
+
+此版本修复了 PostgreSQL 同步链路中的一个断档问题：初始快照虽然可以正常完成，但切换到 CDC 时会从“当前 WAL 位置”重新开始，而不是从快照一致性点继续，导致快照与 CDC 切换窗口内产生的插入数据被遗漏。
+
+### 🐛 问题修复
+
+#### 1. PostgreSQL CDC 启动复用快照检查点 (`internal/orchestrator/multi_orchestrator.go`)
+
+**修复 PostgreSQL 在快照完成后以 `nil` checkpoint 启动 CDC 的问题：**
+
+- **问题：** 初始快照完成后，PostgreSQL CDC 总是以 `nil` checkpoint 启动
+- **根本原因：** 多数据源编排层在从快照模式切换到 CDC 模式时，没有复用 PostgreSQL 快照阶段生成的 checkpoint
+- **修复：** 仅对 PostgreSQL 任务复用 `lastCp`，并将其传给 `connector.Start(...)`
+- **影响：** PostgreSQL CDC 现在会从快照 LSN 继续，而不是直接跳到启动时的最新 WAL 位置
+
+#### 2. PostgreSQL 快照检查点字段映射修复 (`internal/orchestrator/multi_orchestrator.go`)
+
+**修复 PostgreSQL 快照事件错误写入 MySQL checkpoint 字段的问题：**
+
+- **问题：** PostgreSQL 快照事件把位点写进了 `MysqlBinlogFile` 和 `MysqlBinlogPos`
+- **根本原因：** `processSnapshotChunk()` 对所有快照源都复用了偏向 MySQL 的 checkpoint 结构
+- **修复：** 按 connector 类型做 checkpoint 映射，PostgreSQL 快照事件改为填充 `Position` 和 `PostgresLsn`
+- **影响：** PostgreSQL checkpoint 持久化和恢复现在会使用正确的 LSN 字段，日志中也不会再出现类似 `:0` 的误导性输出
+
+#### 3. 快照分块一致性 LSN 透传修复 (`internal/connectors/postgresql/parallel_integration.go`)
+
+**修复快照分块使用漂移 WAL 位置而不是单一一致性点的问题：**
+
+- **问题：** PostgreSQL 每个 snapshot chunk 在发送时都会重新读取 `pg_current_wal_lsn()`，长时间快照过程中 chunk 标记会不断漂移
+- **根本原因：** 适配器虽然在快照开始时拿到了 `consistencyLSN`，但后续分块处理并没有继续传递这个值
+- **修复：** 在快照开始时捕获一次 `consistencyLSN`，并将同一个值附加到所有输出 chunk
+- **影响：** 快照完成点与 CDC 启动点现在共享同一个稳定的 PostgreSQL 衔接位点
+
+### ✅ 验证
+
+修复后：
+
+- PostgreSQL 修复路径不会改变现有 MySQL 和 MongoDB 的行为
+- 快照记录与 CDC 启动会使用同一个 PostgreSQL LSN 衔接点
+- PostgreSQL checkpoint 日志会显示真实 LSN，而不是 MySQL 风格的占位输出
+
+已执行验证：
+
+- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/connectors/postgresql/parallel_integration.go`
+- `go test -run '^$' ./internal/orchestrator ./internal/connectors/postgresql`
+- `go test ./internal/orchestrator ./internal/connectors/postgresql`
+  说明：包级编译已通过；失败断言来自仓库中原本存在的 `lsn_manager_test`，与本次修改无关。
+
+---
+
 ## [v1.4.3] - 2026-03-10
 
 ### 🔧 快照主键提取修复

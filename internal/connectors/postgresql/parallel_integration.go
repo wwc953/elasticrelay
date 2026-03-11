@@ -238,7 +238,7 @@ func (psa *PostgreSQLSnapshotAdapter) CreateTableChunks(ctx context.Context, tab
 }
 
 // ProcessChunk processes a single chunk of data
-func (psa *PostgreSQLSnapshotAdapter) ProcessChunk(ctx context.Context, chunk *parallel.ChunkInfo, stream pb.ConnectorService_BeginSnapshotServer) error {
+func (psa *PostgreSQLSnapshotAdapter) ProcessChunk(ctx context.Context, chunk *parallel.ChunkInfo, consistencyLSN string, stream pb.ConnectorService_BeginSnapshotServer) error {
 	log.Printf("Processing chunk %s", chunk.ID)
 
 	// Build query
@@ -315,7 +315,7 @@ func (psa *PostgreSQLSnapshotAdapter) ProcessChunk(ctx context.Context, chunk *p
 
 		// Send chunk when it reaches the batch size
 		if len(records) >= 100 { // Batch size
-			if err := psa.sendChunk(stream, records); err != nil {
+			if err := psa.sendChunk(stream, records, consistencyLSN); err != nil {
 				return fmt.Errorf("failed to send chunk: %w", err)
 			}
 			records = nil
@@ -324,7 +324,7 @@ func (psa *PostgreSQLSnapshotAdapter) ProcessChunk(ctx context.Context, chunk *p
 
 	// Send remaining records
 	if len(records) > 0 {
-		if err := psa.sendChunk(stream, records); err != nil {
+		if err := psa.sendChunk(stream, records, consistencyLSN); err != nil {
 			return fmt.Errorf("failed to send final chunk: %w", err)
 		}
 	}
@@ -334,31 +334,18 @@ func (psa *PostgreSQLSnapshotAdapter) ProcessChunk(ctx context.Context, chunk *p
 }
 
 // sendChunk sends a batch of records to the stream
-func (psa *PostgreSQLSnapshotAdapter) sendChunk(stream pb.ConnectorService_BeginSnapshotServer, records []string) error {
-	// Get current LSN for snapshot consistency
-	currentLSN, err := psa.getCurrentLSNForSnapshot(stream.Context())
-	if err != nil {
-		log.Printf("Warning: failed to get current LSN: %v", err)
-		currentLSN = "0/0"
+func (psa *PostgreSQLSnapshotAdapter) sendChunk(stream pb.ConnectorService_BeginSnapshotServer, records []string, consistencyLSN string) error {
+	if consistencyLSN == "" {
+		consistencyLSN = "0/0"
 	}
-
 	chunk := &pb.SnapshotChunk{
 		Records:            records,
-		SnapshotBinlogFile: currentLSN, // Use LSN as snapshot marker
+		Cursor:             consistencyLSN,
+		SnapshotBinlogFile: consistencyLSN, // Preserve legacy behavior for PostgreSQL snapshot markers
 		SnapshotBinlogPos:  0,
 	}
 
 	return stream.Send(chunk)
-}
-
-// getCurrentLSNForSnapshot gets the current LSN in a snapshot-consistent way
-func (psa *PostgreSQLSnapshotAdapter) getCurrentLSNForSnapshot(ctx context.Context) (string, error) {
-	var lsn string
-	err := psa.dbConnection.QueryRowContext(ctx, "SELECT pg_current_wal_lsn()").Scan(&lsn)
-	if err != nil {
-		return "", fmt.Errorf("failed to get current LSN: %w", err)
-	}
-	return lsn, nil
 }
 
 // convertColumnValue converts a database value using the type mapper
@@ -471,7 +458,7 @@ func (psm *ParallelSnapshotManager) StartSnapshot(ctx context.Context, jobID str
 
 	// Process each table
 	for _, tableName := range tables {
-		if err := psm.processTable(ctx, tableName, stream); err != nil {
+		if err := psm.processTable(ctx, tableName, consistencyLSN, stream); err != nil {
 			log.Printf("Error processing table %s: %v", tableName, err)
 			continue
 		}
@@ -482,7 +469,7 @@ func (psm *ParallelSnapshotManager) StartSnapshot(ctx context.Context, jobID str
 }
 
 // processTable processes a single table using parallel chunks
-func (psm *ParallelSnapshotManager) processTable(ctx context.Context, tableName string, stream pb.ConnectorService_BeginSnapshotServer) error {
+func (psm *ParallelSnapshotManager) processTable(ctx context.Context, tableName string, consistencyLSN string, stream pb.ConnectorService_BeginSnapshotServer) error {
 	log.Printf("Processing table %s", tableName)
 
 	// Get table information
@@ -499,7 +486,7 @@ func (psm *ParallelSnapshotManager) processTable(ctx context.Context, tableName 
 
 	// Process chunks
 	for _, chunk := range chunks {
-		if err := psm.adapter.ProcessChunk(ctx, chunk, stream); err != nil {
+		if err := psm.adapter.ProcessChunk(ctx, chunk, consistencyLSN, stream); err != nil {
 			return fmt.Errorf("failed to process chunk %s: %w", chunk.ID, err)
 		}
 	}

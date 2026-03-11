@@ -1,5 +1,57 @@
 # ElasticRelay Changelog
 
+## [v1.4.4] - 2026-03-11
+
+### 🔧 PostgreSQL Snapshot-to-CDC Continuity Fix
+
+This release fixes a PostgreSQL synchronization gap where an initial snapshot could finish successfully, but CDC would restart from the current WAL position instead of the snapshot consistency point, causing inserts generated during the handoff window to be missed.
+
+### 🐛 Bug Fixes
+
+#### 1. PostgreSQL CDC Start Checkpoint Reuse (`internal/orchestrator/multi_orchestrator.go`)
+
+**Fixed PostgreSQL CDC starting from `nil` checkpoint after snapshot:**
+
+- **Issue**: After initial snapshot completed, PostgreSQL CDC always started with `nil` checkpoint
+- **Root Cause**: The shared multi-source orchestrator did not reuse the PostgreSQL snapshot checkpoint when switching from snapshot mode to CDC mode
+- **Fix**: Reused `lastCp` only for PostgreSQL jobs and passed it into `connector.Start(...)`
+- **Impact**: PostgreSQL CDC now resumes from the snapshot LSN instead of jumping to the current WAL position
+
+#### 2. PostgreSQL Snapshot Checkpoint Field Mapping (`internal/orchestrator/multi_orchestrator.go`)
+
+**Fixed PostgreSQL snapshot events being written into MySQL checkpoint fields:**
+
+- **Issue**: Snapshot events from PostgreSQL stored their marker in `MysqlBinlogFile` and `MysqlBinlogPos`
+- **Root Cause**: `processSnapshotChunk()` used a MySQL-oriented checkpoint structure for all snapshot sources
+- **Fix**: Added connector-type specific checkpoint mapping so PostgreSQL snapshot events populate `Position` and `PostgresLsn`
+- **Impact**: PostgreSQL checkpoint persistence and recovery now use the correct LSN fields, and logs no longer show misleading values such as `:0`
+
+#### 3. Snapshot Chunk Consistency LSN Propagation (`internal/connectors/postgresql/parallel_integration.go`)
+
+**Fixed snapshot chunks using moving WAL positions instead of one consistency point:**
+
+- **Issue**: Each PostgreSQL snapshot chunk fetched `pg_current_wal_lsn()` at send time, so the chunk marker could drift during a long-running snapshot
+- **Root Cause**: The adapter calculated a snapshot consistency point once, but did not propagate it through chunk processing
+- **Fix**: Captured one `consistencyLSN` for the snapshot and attached the same value to every emitted chunk
+- **Impact**: Snapshot completion and CDC startup now share one stable PostgreSQL handoff point
+
+### ✅ Verification
+
+After this fix:
+
+- PostgreSQL jobs keep their existing MySQL and MongoDB behavior unchanged
+- Snapshot records and CDC startup use the same PostgreSQL LSN handoff point
+- PostgreSQL checkpoint logs show a real LSN instead of MySQL-style placeholder output
+
+Validation performed:
+
+- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/connectors/postgresql/parallel_integration.go`
+- `go test -run '^$' ./internal/orchestrator ./internal/connectors/postgresql`
+- `go test ./internal/orchestrator ./internal/connectors/postgresql`
+  Note: package compilation passed; the failing assertions came from pre-existing `lsn_manager_test` cases unrelated to this change.
+
+---
+
 ## [v1.4.3] - 2026-03-10
 
 ### 🔧 Snapshot Primary Key Extraction Fix
