@@ -1,11 +1,11 @@
 {
   "postgresql-to-es-cdc": {
     "job_id": "postgresql-to-es-cdc",
-    "lsn": "",
+    "lsn": "0/4809710",
     "timeline": 0,
     "slot_name": "",
     "publication": "",
-    "last_update": "2025-11-25T17:14:58.955893+08:00",
+    "last_update": "2026-03-11T22:49:08.950107+08:00",
     "commit_frequency": 0,
     "batch_size": 0
   }

@@ -22,6 +22,7 @@ import (
 	"github.com/yogoosoft/elasticrelay/internal/connectors/postgresql"
 	"github.com/yogoosoft/elasticrelay/internal/dlq"
 	"github.com/yogoosoft/elasticrelay/internal/parallel"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -31,6 +32,7 @@ import (
 const (
 	batchSize      = 100
 	commitInterval = 5 * time.Second
+	cdcRetryDelay  = 3 * time.Second
 )
 
 // MultiOrchestrator supports multiple data sources and concurrent CDC processing
@@ -69,10 +71,13 @@ type MultiJob struct {
 	transformClient   pb.TransformServiceClient
 
 	// Batch processing
-	batch      []*pb.ChangeEvent
-	batchMutex sync.Mutex
-	lastCp     *pb.Checkpoint
-	cpMutex    sync.RWMutex
+	batch                   []*pb.ChangeEvent
+	batchMutex              sync.Mutex
+	cdcEvents               chan *pb.ChangeEvent
+	lastCp                  *pb.Checkpoint
+	lastCommittedCpPosition string
+	lastCheckpointCommitAt  time.Time
+	cpMutex                 sync.RWMutex
 
 	// Parallel snapshot processing
 	parallelManager *parallel.ParallelSnapshotManager
@@ -323,6 +328,7 @@ func (mo *MultiOrchestrator) CreateJob(ctx context.Context, req *pb.CreateJobReq
 		jobOptions:        jobConfig.Options, // Copy job options for configuration access
 		sinkConfig:        sinkConfig,        // Copy sink options for index naming, etc.
 		dlqManager:        mo.dlqManager,     // Share DLQ manager from orchestrator
+		cdcEvents:         make(chan *pb.ChangeEvent, batchSize*20),
 	}
 
 	// Initialize parallel snapshot manager if enabled
@@ -390,8 +396,8 @@ func (j *MultiJob) run() {
 	log.Printf("MultiJob '%s': Starting synchronization from %s to %s", j.ID, j.SourceID, j.SinkID)
 	defer log.Printf("MultiJob '%s': Stopped", j.ID)
 
-	// Start batch flusher
-	go j.batchFlusher()
+	// Process CDC events asynchronously so WAL reads are not blocked by sink latency.
+	go j.cdcBatchProcessor()
 
 	// Check if initial sync is enabled and needed
 	if j.needsInitialSync() {
@@ -438,10 +444,35 @@ func (j *MultiJob) startCDC() {
 			log.Printf("MultiJob '%s': MySQL CDC error: %v", j.ID, err)
 		}
 	case *postgresql.Connector:
-		log.Printf("MultiJob '%s': Starting PostgreSQL CDC stream", j.ID)
-		err := connector.Start(stream, startCheckpoint)
-		if err != nil {
-			log.Printf("MultiJob '%s': PostgreSQL CDC error: %v", j.ID, err)
+		attempt := 1
+		for {
+			if err := j.ctx.Err(); err != nil {
+				return
+			}
+
+			j.cpMutex.RLock()
+			startCheckpoint = j.lastCp
+			j.cpMutex.RUnlock()
+			if startCheckpoint != nil && startCheckpoint.PostgresLsn != "" {
+				log.Printf("MultiJob '%s': Reusing PostgreSQL checkpoint for CDC start: %s", j.ID, startCheckpoint.PostgresLsn)
+			} else {
+				startCheckpoint = nil
+			}
+
+			log.Printf("MultiJob '%s': Starting PostgreSQL CDC stream (attempt %d)", j.ID, attempt)
+			err := connector.Start(stream, startCheckpoint, j.ID)
+			if err == nil {
+				log.Printf("MultiJob '%s': PostgreSQL CDC stream ended without error, restarting in %v", j.ID, cdcRetryDelay)
+			} else {
+				log.Printf("MultiJob '%s': PostgreSQL CDC error: %v", j.ID, err)
+				log.Printf("MultiJob '%s': Restarting PostgreSQL CDC stream in %v", j.ID, cdcRetryDelay)
+			}
+			j.resetCDCBuffers()
+
+			if !sleepWithContext(j.ctx, cdcRetryDelay) {
+				return
+			}
+			attempt++
 		}
 	case *mongodb.Connector:
 		log.Printf("MultiJob '%s': Starting MongoDB CDC stream (Change Streams)", j.ID)
@@ -452,6 +483,18 @@ func (j *MultiJob) startCDC() {
 	default:
 		log.Printf("MultiJob '%s': Unsupported connector type: %T", j.ID, connector)
 		return
+	}
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -470,8 +513,7 @@ func (s *jobCDCStream) Send(event *pb.ChangeEvent) error {
 			SourceType: s.job.SourceID,
 		}
 	}
-	s.job.addToBatch(event)
-	return nil
+	return s.job.addToBatch(event)
 }
 
 // Context returns the job context
@@ -512,23 +554,51 @@ func (s *jobCDCStream) SetTrailer(md metadata.MD) {
 }
 
 // addToBatch adds event to job's batch
-func (j *MultiJob) addToBatch(event *pb.ChangeEvent) {
-	j.batchMutex.Lock()
-	defer j.batchMutex.Unlock()
-
-	j.batch = append(j.batch, event)
-	if len(j.batch) >= batchSize {
-		j.flushBatch()
+func (j *MultiJob) addToBatch(event *pb.ChangeEvent) error {
+	select {
+	case <-j.ctx.Done():
+		return j.ctx.Err()
+	case j.cdcEvents <- event:
+		return nil
 	}
 }
 
-// batchFlusher periodically flushes batches
-func (j *MultiJob) batchFlusher() {
+// resetCDCBuffers drops in-memory CDC events from a failed attempt.
+func (j *MultiJob) resetCDCBuffers() {
+	j.batchMutex.Lock()
+	droppedBatch := len(j.batch)
+	j.batch = nil
+	j.batchMutex.Unlock()
+
+	droppedQueued := 0
+	for {
+		select {
+		case <-j.cdcEvents:
+			droppedQueued++
+		default:
+			if droppedBatch > 0 || droppedQueued > 0 {
+				log.Printf("MultiJob '%s': Cleared %d batched and %d queued CDC events before restart",
+					j.ID, droppedBatch, droppedQueued)
+			}
+			return
+		}
+	}
+}
+
+// cdcBatchProcessor batches CDC events without blocking the replication reader.
+func (j *MultiJob) cdcBatchProcessor() {
 	ticker := time.NewTicker(commitInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case event := <-j.cdcEvents:
+			j.batchMutex.Lock()
+			j.batch = append(j.batch, event)
+			if len(j.batch) >= batchSize {
+				j.flushBatch()
+			}
+			j.batchMutex.Unlock()
 		case <-ticker.C:
 			j.batchMutex.Lock()
 			j.flushBatch()
@@ -701,17 +771,29 @@ func (j *MultiJob) updateCheckpoint(cp *pb.Checkpoint) {
 	j.lastCp = cp
 }
 
-// commitCheckpoint commits checkpoint to persistent storage
+// commitCheckpoint commits checkpoint to persistent storage at most once per commit interval.
 func (j *MultiJob) commitCheckpoint() {
-	j.cpMutex.RLock()
-	defer j.cpMutex.RUnlock()
-
+	j.cpMutex.Lock()
 	if j.lastCp == nil {
+		j.cpMutex.Unlock()
 		return
 	}
 
-	// Connect to the MySQL connector's gRPC service to commit checkpoint
-	// All services are running on the same gRPC server
+	position := j.formatCheckpointPosition(j.lastCp)
+	if position == j.lastCommittedCpPosition {
+		j.cpMutex.Unlock()
+		return
+	}
+	if !j.lastCheckpointCommitAt.IsZero() && time.Since(j.lastCheckpointCommitAt) < commitInterval {
+		j.cpMutex.Unlock()
+		return
+	}
+
+	checkpoint := proto.Clone(j.lastCp).(*pb.Checkpoint)
+	j.cpMutex.Unlock()
+
+	// Connect to the connector service to commit checkpoint.
+	// All services are running on the same gRPC server.
 	conn, err := grpc.DialContext(j.ctx, "localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Printf("MultiJob '%s': Failed to connect to connector service: %v", j.ID, err)
@@ -722,14 +804,17 @@ func (j *MultiJob) commitCheckpoint() {
 	connectorClient := pb.NewConnectorServiceClient(conn)
 	_, err = connectorClient.CommitCheckpoint(j.ctx, &pb.CommitCheckpointRequest{
 		JobId:      j.ID,
-		Checkpoint: j.lastCp,
+		Checkpoint: checkpoint,
 	})
 	if err != nil {
 		log.Printf("MultiJob '%s': Failed to commit checkpoint: %v", j.ID, err)
-	} else {
-		log.Printf("MultiJob '%s': Successfully committed checkpoint at %s",
-			j.ID, j.formatCheckpointPosition(j.lastCp))
+		return
 	}
+
+	j.cpMutex.Lock()
+	j.lastCommittedCpPosition = position
+	j.lastCheckpointCommitAt = time.Now()
+	j.cpMutex.Unlock()
 }
 
 func (j *MultiJob) formatCheckpointPosition(cp *pb.Checkpoint) string {
@@ -1072,6 +1157,14 @@ func (j *MultiJob) performInitialSync() error {
 	// Get table filters from connector instance
 	if j.connectorInstance == nil || j.connectorInstance.Config == nil {
 		return fmt.Errorf("connector instance or config is nil")
+	}
+
+	if j.shouldForceInitialSync() && strings.EqualFold(j.connectorInstance.Type, "postgresql") {
+		if connector, ok := j.connectorInstance.Connector.(*postgresql.Connector); ok {
+			if err := connector.ResetReplicationSlot(j.ctx, j.ID); err != nil {
+				return fmt.Errorf("failed to reset PostgreSQL replication slot for force_initial_sync: %w", err)
+			}
+		}
 	}
 
 	tables := j.connectorInstance.Config.TableFilters

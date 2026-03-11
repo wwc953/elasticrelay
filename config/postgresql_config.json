@@ -10,7 +10,7 @@
       "user": "postgres",
       "password": "postgres",
       "database": "elasticrelay",
-      "table_filters": ["test_table", "users", "orders", "products"],
+      "table_filters": ["test_data"],
       "options": {
         "ssl_mode": "disable",
         "slot_name": "elasticrelay_slot",

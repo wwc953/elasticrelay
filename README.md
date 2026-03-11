@@ -364,6 +364,50 @@ ElasticRelay provides comprehensive PostgreSQL CDC capabilities with advanced fe
 }
 ```
 
+#### PostgreSQL Troubleshooting Checklist
+
+If PostgreSQL CDC does not fully catch up, use the following checklist before investigating Elasticsearch or transform rules.
+
+**Common symptoms:**
+
+- Elasticsearch count stops far below the inserted row count after a large PostgreSQL write
+- Logs show errors such as `unsupported logical replication message` or `unknown copy data message type`
+- Repeated document overwrites appear because CDC events use duplicate `_id` values
+- `postgresql_checkpoints.json` advances, but Elasticsearch document count stalls early
+
+**Recommended reset procedure for a clean re-run:**
+
+1. Stop ElasticRelay.
+2. Remove the old checkpoint file if you want a full PostgreSQL re-sync.
+3. Delete the target Elasticsearch index or index prefix used for the test.
+4. If you are rebuilding the PostgreSQL table from scratch, also verify that the old replication slot is not left behind in an inactive state.
+
+```sql
+SELECT slot_name, active, restart_lsn, confirmed_flush_lsn
+FROM pg_replication_slots
+WHERE slot_name LIKE 'elasticrelay_slot%';
+```
+
+Drop an inactive slot only when you intentionally want to restart from a clean state:
+
+```sql
+SELECT pg_drop_replication_slot('elasticrelay_slot_postgresql_to_es_cdc');
+```
+
+**What a healthy PostgreSQL validation run looks like:**
+
+- Insert 10,000 rows into the PostgreSQL test table and Elasticsearch count also reaches `10000`
+- No duplicate primary key warnings appear in logs
+- No PostgreSQL replication parse errors appear during CDC
+- `postgresql_checkpoints.json` continues to move forward with a real PostgreSQL LSN
+
+**Practical validation tips:**
+
+- Keep `table_filters` narrowed to the test table while validating CDC fixes
+- Ensure the synchronized PostgreSQL table has a real primary key
+- Use `force_initial_sync` when you intentionally want ElasticRelay to rebuild snapshot state from scratch
+- If you manually reset source tables and checkpoints outside ElasticRelay, also clean up any inactive PostgreSQL replication slot left by the previous run
+
 ### MongoDB Support
 
 ElasticRelay provides complete MongoDB CDC capabilities using Change Streams:

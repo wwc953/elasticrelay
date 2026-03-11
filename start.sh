@@ -4,8 +4,8 @@ cd "$(dirname "$0")"
 
 # Configuration
 BINARY="./bin/elasticrelay-darwin-arm64"
-#CONFIG="./config/postgresql_config.json"
-CONFIG="./config/mysql_config.json"
+CONFIG="./config/postgresql_config.json"
+#CONFIG="./config/mysql_config.json"
 # CONFIG="./config/mongodb_config.json"
 PORT="50051"
 LOG_DIR="./logs"
@@ -13,8 +13,8 @@ PID_FILE="./logs/elasticrelay.pid"
 
 # Transform configuration (optional)
 # Set to empty string to disable transform rules (pass-through mode)
-TRANSFORM_CONFIG="./config/mysql_transform.json"
-# TRANSFORM_CONFIG=""  # Uncomment to disable transform
+#TRANSFORM_CONFIG="./config/mysql_transform.json"
+TRANSFORM_CONFIG=""  # Uncomment to disable transform
 
 # Create logs directory if it doesn't exist
 mkdir -p "$LOG_DIR"

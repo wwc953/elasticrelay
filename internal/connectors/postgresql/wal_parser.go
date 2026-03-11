@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	pb "github.com/yogoosoft/elasticrelay/api/gateway/v1"
@@ -78,6 +80,7 @@ type RelationInfo struct {
 	RelationName    string
 	ReplicaIdentity byte
 	Columns         []ColumnInfo
+	PrimaryKeyCols  []string
 }
 
 // ColumnInfo contains information about a column
@@ -115,7 +118,11 @@ type WALParser struct {
 	currentTxn   *TransactionInfo
 	tableFilters []string
 	typeMapper   *TypeMapper
+	logicalBuf   []byte
 }
+
+var errIncompleteLogicalMessage = errors.New("incomplete logical replication message")
+var errUnsupportedLogicalMessage = errors.New("unsupported logical replication message")
 
 // NewWALParser creates a new WAL parser
 func NewWALParser(conn *pgconn.PgConn, slotName, publication, startLSN string, tableFilters []string) *WALParser {
@@ -139,7 +146,7 @@ func (wp *WALParser) AddRelation(relation *RelationInfo) {
 func (wp *WALParser) StartReplication(ctx context.Context, handler *EventHandler) error {
 	// Build replication command with correct syntax
 	// All options should be in a single parentheses, comma-separated
-	cmd := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (\"publication_names\" '%s', \"proto_version\" '1', \"messages\" 'true')",
+	cmd := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (\"publication_names\" '%s', \"proto_version\" '1', \"messages\" 'false')",
 		wp.slotName, wp.startLSN, wp.publication)
 
 	log.Printf("Starting logical replication with command: %s", cmd)
@@ -188,11 +195,6 @@ func (wp *WALParser) StartReplication(ctx context.Context, handler *EventHandler
 func (wp *WALParser) processMessages(ctx context.Context, handler *EventHandler) error {
 	logger.Debug("Entering processMessages function")
 
-	// Create a ticker for periodic keepalive messages (every 10 seconds - more frequent)
-	keepaliveTicker := time.NewTicker(10 * time.Second)
-	defer keepaliveTicker.Stop()
-	logger.Debug("Created keepalive ticker")
-
 	// Track the last received LSN for status updates - initialize with starting LSN
 	lastReceivedLSN, err := wp.parseLSNToUint64(wp.startLSN)
 	if err != nil {
@@ -209,93 +211,65 @@ func (wp *WALParser) processMessages(ctx context.Context, handler *EventHandler)
 	}
 	logger.Debug("Initial keepalive sent successfully")
 
-	// Create a channel to receive messages asynchronously
-	msgChan := make(chan pgproto3.BackendMessage, 1)
-	errChan := make(chan error, 1)
-	logger.Debug("Created message channels")
+	nextKeepalive := time.Now().Add(10 * time.Second)
+	readTimeout := 1 * time.Second
 
-	// Start a goroutine to continuously read messages
-	go func() {
-		logger.Debug("Starting message receiving goroutine")
-		// Add a small delay before starting to receive messages
-		time.Sleep(200 * time.Millisecond)
-		logger.Debug("Starting to receive messages after delay")
-
-		for {
-			logger.Debug("Waiting to receive message...")
-
-			// Create a context with timeout for each receive operation
-			receiveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			msg, err := wp.conn.ReceiveMessage(receiveCtx)
-			cancel()
-
-			if err != nil {
-				logger.Debug("ReceiveMessage error: %v", err)
-				// If it's a timeout or context error, continue the loop
-				if receiveCtx.Err() != nil {
-					logger.Debug("Receive timeout, continuing...")
-					continue
-				}
-				select {
-				case errChan <- err:
-				case <-ctx.Done():
-					return
-				}
-				return
-			}
-			logger.Debug("Received message type: %T", msg)
-			select {
-			case msgChan <- msg:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	logger.Debug("Starting main message processing loop")
 	for {
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			logger.Debug("Context cancelled, exiting processMessages")
-			return ctx.Err()
-		case <-keepaliveTicker.C:
-			// Send periodic keepalive to prevent timeout
+			return err
+		}
+
+		now := time.Now()
+		if !now.Before(nextKeepalive) {
 			log.Printf("Sending periodic keepalive message")
 			if err := wp.sendStandbyStatusUpdate(ctx, lastReceivedLSN, lastReceivedLSN, lastReceivedLSN); err != nil {
 				log.Printf("Failed to send periodic keepalive: %v", err)
 			}
-		case msg := <-msgChan:
-			logger.Debug("Processing message from channel: %T", msg)
-			// Process the message based on its type
-			if err := wp.handleMessage(msg, handler); err != nil {
-				log.Printf("Error handling message: %v", err)
+			nextKeepalive = time.Now().Add(10 * time.Second)
+		}
+
+		if err := wp.conn.Conn().SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+		msg, err := wp.conn.ReceiveMessage(ctx)
+		if clearErr := wp.conn.Conn().SetReadDeadline(time.Time{}); clearErr != nil {
+			return fmt.Errorf("failed to clear read deadline: %w", clearErr)
+		}
+
+		if err != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if pgconn.Timeout(err) {
 				continue
 			}
-
-			// Update last received LSN from XLogData messages
-			if copyData, ok := msg.(*pgproto3.CopyData); ok && len(copyData.Data) > 0 {
-				if copyData.Data[0] == 'w' && len(copyData.Data) >= 25 {
-					// Extract walStart and walEnd from XLogData message
-					// Message format: 'w' + walStart(8) + walEnd(8) + sendTime(8) + data
-					walStart := binary.BigEndian.Uint64(copyData.Data[1:9])
-					walEnd := binary.BigEndian.Uint64(copyData.Data[9:17])
-
-					// Use walStart as the LSN position (walEnd is usually 0 in streaming mode)
-					if walStart > 0 {
-						lastReceivedLSN = walStart
-					} else if walEnd > 0 {
-						lastReceivedLSN = walEnd
-					}
-
-					logger.Debug("LSN update: walStart=%X/%X, walEnd=%X/%X, using LSN=%X/%X",
-						uint32(walStart>>32), uint32(walStart),
-						uint32(walEnd>>32), uint32(walEnd),
-						uint32(lastReceivedLSN>>32), uint32(lastReceivedLSN))
-				}
-			}
-		case err := <-errChan:
-			logger.Debug("Received error from channel: %v", err)
 			return fmt.Errorf("failed to receive message: %w", err)
+		}
+
+		logger.Debug("Processing message from connection: %T", msg)
+		if err := wp.handleMessage(msg, handler); err != nil {
+			return fmt.Errorf("error handling replication message: %w", err)
+		}
+
+		if copyData, ok := msg.(*pgproto3.CopyData); ok && len(copyData.Data) > 0 {
+			if copyData.Data[0] == pglogrepl.XLogDataByteID && len(copyData.Data) >= 25 {
+				xld, err := pglogrepl.ParseXLogData(copyData.Data[1:])
+				if err != nil {
+					log.Printf("Failed to parse XLogData for LSN update: %v", err)
+					continue
+				}
+
+				if xld.WALStart > 0 {
+					lastReceivedLSN = uint64(xld.WALStart)
+				} else if xld.ServerWALEnd > 0 {
+					lastReceivedLSN = uint64(xld.ServerWALEnd)
+				}
+
+				logger.Debug("LSN update: walStart=%s, walEnd=%s, using LSN=%X/%X",
+					xld.WALStart.String(), xld.ServerWALEnd.String(),
+					uint32(lastReceivedLSN>>32), uint32(lastReceivedLSN))
+			}
 		}
 	}
 }
@@ -336,376 +310,202 @@ func (wp *WALParser) processCopyData(data []byte, handler *EventHandler) error {
 		logger.Debug("Processing primary keepalive message")
 		return wp.parsePrimaryKeepalive(data[1:])
 	default:
-		log.Printf("Unknown copy data message type: %c (0x%02x)", msgType, msgType)
+		return fmt.Errorf("unknown copy data message type: %c (0x%02x)", msgType, msgType)
 	}
-
-	return nil
 }
 
 // parseXLogData parses XLogData messages containing actual WAL records
 func (wp *WALParser) parseXLogData(data []byte, handler *EventHandler) error {
-	if len(data) < 24 {
-		return fmt.Errorf("XLogData message too short")
+	xld, err := pglogrepl.ParseXLogData(data)
+	if err != nil {
+		return fmt.Errorf("failed to parse XLogData message: %w", err)
 	}
-
-	// Parse WAL data header
-	walStart := binary.BigEndian.Uint64(data[0:8])
-	walEnd := binary.BigEndian.Uint64(data[8:16])
-	sendTime := int64(binary.BigEndian.Uint64(data[16:24]))
 
 	logger.Debug("XLogData: walStart=%X/%X, walEnd=%X/%X, sendTime=%d",
-		uint32(walStart>>32), uint32(walStart),
-		uint32(walEnd>>32), uint32(walEnd),
-		sendTime)
+		uint32(uint64(xld.WALStart)>>32), uint32(uint64(xld.WALStart)),
+		uint32(uint64(xld.ServerWALEnd)>>32), uint32(uint64(xld.ServerWALEnd)),
+		xld.ServerTime.UnixMicro())
 
-	// Parse logical decoding message
-	if len(data) > 24 {
-		return wp.parseLogicalMessage(data[24:], handler)
+	currentLSN := uint64(xld.WALStart)
+	if currentLSN == 0 {
+		currentLSN = uint64(xld.ServerWALEnd)
+	}
+	if currentLSN > 0 {
+		handler.currentLSN = formatLSN(currentLSN)
 	}
 
-	return nil
+	if len(xld.WALData) == 0 {
+		return nil
+	}
+
+	wp.logicalBuf = append(wp.logicalBuf, xld.WALData...)
+	return wp.processBufferedLogicalMessages(handler)
 }
 
-// parseLogicalMessage parses logical decoding messages
+// parseLogicalMessage parses all pgoutput messages from a single XLogData payload.
 func (wp *WALParser) parseLogicalMessage(data []byte, handler *EventHandler) error {
 	if len(data) == 0 {
 		logger.Debug("parseLogicalMessage: empty data")
 		return nil
 	}
 
+	offset := 0
+	for offset < len(data) {
+		consumed, err := wp.parseSingleLogicalMessage(data[offset:], handler)
+		if err != nil {
+			return fmt.Errorf("failed to parse logical replication message at offset %d: %w", offset, err)
+		}
+		if consumed <= 0 {
+			return fmt.Errorf("logical replication parser made no progress at offset %d", offset)
+		}
+		offset += consumed
+	}
+
+	return nil
+}
+
+func (wp *WALParser) processBufferedLogicalMessages(handler *EventHandler) error {
+	offset := 0
+	for offset < len(wp.logicalBuf) {
+		consumed, err := wp.parseSingleLogicalMessage(wp.logicalBuf[offset:], handler)
+		if err != nil {
+			if errors.Is(err, errIncompleteLogicalMessage) {
+				break
+			}
+			return fmt.Errorf("failed to parse logical replication message at offset %d: %w", offset, err)
+		}
+		if consumed <= 0 {
+			return fmt.Errorf("logical replication parser made no progress at offset %d", offset)
+		}
+		offset += consumed
+	}
+
+	if offset == 0 {
+		return nil
+	}
+
+	if offset >= len(wp.logicalBuf) {
+		wp.logicalBuf = nil
+		return nil
+	}
+
+	wp.logicalBuf = append([]byte(nil), wp.logicalBuf[offset:]...)
+	return nil
+}
+
+func (wp *WALParser) parseSingleLogicalMessage(data []byte, handler *EventHandler) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+
 	msgType := data[0]
-	logger.Debug("parseLogicalMessage: message type '%c' (0x%02x), data length: %d", msgType, msgType, len(data))
+	payload := data[1:]
 
 	switch msgType {
-	case 'B': // Begin transaction
-		logger.Debug("Parsing BEGIN transaction message")
-		return wp.parseBegin(data[1:])
-	case 'C': // Commit transaction
-		logger.Debug("Parsing COMMIT transaction message")
-		return wp.parseCommit(data[1:])
-	case 'R': // Relation
-		logger.Debug("Parsing RELATION message")
-		return wp.parseRelation(data[1:])
-	case 'I': // Insert
-		logger.Debug("Parsing INSERT message")
-		return wp.parseInsert(data[1:], handler)
-	case 'U': // Update
-		logger.Debug("Parsing UPDATE message")
-		return wp.parseUpdate(data[1:], handler)
-	case 'D': // Delete
-		logger.Debug("Parsing DELETE message")
-		return wp.parseDelete(data[1:], handler)
-	case 'T': // Truncate
-		logger.Debug("Parsing TRUNCATE message")
-		return wp.parseTruncate(data[1:], handler)
+	case 'B':
+		consumed, err := wp.parseBegin(payload)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'C':
+		consumed, err := wp.parseCommit(payload)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'R':
+		consumed, err := wp.parseRelation(payload)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'I':
+		consumed, err := wp.parseInsert(payload, handler)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'U':
+		consumed, err := wp.parseUpdate(payload, handler)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'D':
+		consumed, err := wp.parseDelete(payload, handler)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'T':
+		consumed, err := wp.parseTruncate(payload, handler)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'Y':
+		consumed, err := parseTypeMessage(payload)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'O':
+		consumed, err := parseOriginMessage(payload)
+		return 1 + consumed, normalizeLogicalMessageError(err)
+	case 'M':
+		consumed, err := parseGenericMessage(payload)
+		return 1 + consumed, normalizeLogicalMessageError(err)
 	default:
-		log.Printf("Unknown logical message type: '%c' (0x%02x), first 32 bytes: %v", msgType, msgType, data[:min(32, len(data))])
+		return 0, fmt.Errorf("%w: %q", errUnsupportedLogicalMessage, msgType)
 	}
-
-	return nil
 }
 
-// Helper function for min
-func min(a, b int) int {
-	if a < b {
-		return a
+func normalizeLogicalMessageError(err error) error {
+	if err == nil {
+		return nil
 	}
-	return b
+	if isIncompleteLogicalMessageError(err) {
+		return fmt.Errorf("%w: %v", errIncompleteLogicalMessage, err)
+	}
+	return err
 }
 
-// parseBegin parses BEGIN transaction message
-func (wp *WALParser) parseBegin(data []byte) error {
-	if len(data) < 20 {
-		return fmt.Errorf("BEGIN message too short")
-	}
-
-	finalLSN := binary.BigEndian.Uint64(data[0:8])
-	commitTime := int64(binary.BigEndian.Uint64(data[8:16]))
-	xid := binary.BigEndian.Uint32(data[16:20])
-
-	wp.currentTxn = &TransactionInfo{
-		XID:        xid,
-		CommitTime: time.Unix(commitTime/1000000, (commitTime%1000000)*1000),
-		FinalLSN:   fmt.Sprintf("%X/%X", uint32(finalLSN>>32), uint32(finalLSN)),
-	}
-
-	return nil
+func isIncompleteLogicalMessageError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "too short") ||
+		strings.Contains(msg, "not null-terminated") ||
+		strings.Contains(msg, "missing new tuple marker")
 }
 
-// parseCommit parses COMMIT transaction message
-func (wp *WALParser) parseCommit(data []byte) error {
-	if len(data) < 20 {
-		return fmt.Errorf("COMMIT message too short")
-	}
-
-	// Reset current transaction
-	wp.currentTxn = nil
-
-	return nil
-}
-
-// parseRelation parses RELATION message
-func (wp *WALParser) parseRelation(data []byte) error {
-	if len(data) < 7 {
-		return fmt.Errorf("RELATION message too short")
-	}
-
-	relationID := binary.BigEndian.Uint32(data[0:4])
-	offset := 4
-
-	// Parse namespace (null-terminated string)
-	namespaceEnd := offset
-	for namespaceEnd < len(data) && data[namespaceEnd] != 0 {
-		namespaceEnd++
-	}
-	if namespaceEnd >= len(data) {
-		return fmt.Errorf("RELATION message: namespace not null-terminated")
-	}
-	namespace := string(data[offset:namespaceEnd])
-	offset = namespaceEnd + 1 // Skip null terminator
-
-	// Parse relation name (null-terminated string)
-	relationNameEnd := offset
-	for relationNameEnd < len(data) && data[relationNameEnd] != 0 {
-		relationNameEnd++
-	}
-	if relationNameEnd >= len(data) {
-		return fmt.Errorf("RELATION message: relation name not null-terminated")
-	}
-	relationName := string(data[offset:relationNameEnd])
-	offset = relationNameEnd + 1 // Skip null terminator
-
-	// Parse replica identity
-	if offset >= len(data) {
-		return fmt.Errorf("RELATION message too short for replica identity")
-	}
-	replicaIdentity := data[offset]
-	offset++
-
-	// Parse column count
-	if offset+2 > len(data) {
-		return fmt.Errorf("RELATION message too short for column count")
-	}
-	columnCount := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	columns := make([]ColumnInfo, 0, columnCount)
-
-	for i := uint16(0); i < columnCount; i++ {
-		if offset+1 > len(data) {
-			break
-		}
-
-		flags := data[offset]
-		offset++
-
-		// Parse column name (null-terminated string)
-		columnNameEnd := offset
-		for columnNameEnd < len(data) && data[columnNameEnd] != 0 {
-			columnNameEnd++
-		}
-		if columnNameEnd >= len(data) {
-			break
-		}
-		columnName := string(data[offset:columnNameEnd])
-		offset = columnNameEnd + 1 // Skip null terminator
-
-		// Parse type ID and type mod
-		if offset+8 > len(data) {
-			break
-		}
-		typeID := binary.BigEndian.Uint32(data[offset : offset+4])
-		typeMod := int32(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
-		offset += 8
-
+func convertRelationMessage(msg *pglogrepl.RelationMessage) *RelationInfo {
+	columns := make([]ColumnInfo, 0, len(msg.Columns))
+	for _, col := range msg.Columns {
 		columns = append(columns, ColumnInfo{
-			Flags:   flags,
-			Name:    columnName,
-			TypeID:  typeID,
-			TypeMod: typeMod,
+			Flags:    col.Flags,
+			Name:     col.Name,
+			TypeID:   col.DataType,
+			TypeMod:  col.TypeModifier,
+			TypeName: "",
 		})
 	}
 
-	wp.relations[relationID] = &RelationInfo{
-		RelationID:      relationID,
-		Namespace:       namespace,
-		RelationName:    relationName,
-		ReplicaIdentity: replicaIdentity,
+	return &RelationInfo{
+		RelationID:      msg.RelationID,
+		Namespace:       msg.Namespace,
+		RelationName:    msg.RelationName,
+		ReplicaIdentity: msg.ReplicaIdentity,
 		Columns:         columns,
 	}
-
-	logger.Debug("Parsed RELATION: id=%d, schema=%s, table=%s, columns=%d",
-		relationID, namespace, relationName, len(columns))
-
-	return nil
 }
 
-// parseInsert parses INSERT message
-func (wp *WALParser) parseInsert(data []byte, handler *EventHandler) error {
-	if len(data) < 5 {
-		return fmt.Errorf("INSERT message too short")
+func (wp *WALParser) convertTupleData(relationID uint32, tupleType byte, tuple *pglogrepl.TupleData) (*RowData, error) {
+	if tuple == nil {
+		return nil, nil
 	}
-
-	relationID := binary.BigEndian.Uint32(data[0:4])
-	tupleType := data[4]
-
-	if tupleType != 'N' {
-		return fmt.Errorf("unexpected tuple type for INSERT: %c", tupleType)
-	}
-
-	rowData, err := wp.parseTupleData(data[5:], relationID, tupleType)
-	if err != nil {
-		return fmt.Errorf("failed to parse INSERT tuple data: %w", err)
-	}
-
-	return wp.createChangeEvent("INSERT", "", relationID, rowData, nil, handler)
-}
-
-// parseUpdate parses UPDATE message
-func (wp *WALParser) parseUpdate(data []byte, handler *EventHandler) error {
-	if len(data) < 5 {
-		return fmt.Errorf("UPDATE message too short")
-	}
-
-	relationID := binary.BigEndian.Uint32(data[0:4])
-
-	var oldData, newData *RowData
-	var err error
-	offset := 4
-
-	// Parse old tuple (if present)
-	if offset < len(data) {
-		tupleType := data[offset]
-		offset++
-
-		if tupleType == 'O' || tupleType == 'K' {
-			oldData, err = wp.parseTupleData(data[offset:], relationID, tupleType)
-			if err != nil {
-				return fmt.Errorf("failed to parse UPDATE old tuple data: %w", err)
-			}
-
-			// Find next tuple marker
-			for i := offset; i < len(data)-1; i++ {
-				if data[i] == 'N' {
-					offset = i + 1
-					break
-				}
-			}
-		} else if tupleType == 'N' {
-			// No old tuple, this is the new tuple
-			newData, err = wp.parseTupleData(data[offset:], relationID, tupleType)
-			if err != nil {
-				return fmt.Errorf("failed to parse UPDATE new tuple data: %w", err)
-			}
-		}
-	}
-
-	// Parse new tuple
-	if newData == nil && offset < len(data) {
-		newData, err = wp.parseTupleData(data[offset:], relationID, 'N')
-		if err != nil {
-			return fmt.Errorf("failed to parse UPDATE new tuple data: %w", err)
-		}
-	}
-
-	return wp.createChangeEvent("UPDATE", "", relationID, newData, oldData, handler)
-}
-
-// parseDelete parses DELETE message
-func (wp *WALParser) parseDelete(data []byte, handler *EventHandler) error {
-	if len(data) < 5 {
-		return fmt.Errorf("DELETE message too short")
-	}
-
-	relationID := binary.BigEndian.Uint32(data[0:4])
-	tupleType := data[4]
-
-	if tupleType != 'O' && tupleType != 'K' {
-		return fmt.Errorf("unexpected tuple type for DELETE: %c", tupleType)
-	}
-
-	rowData, err := wp.parseTupleData(data[5:], relationID, tupleType)
-	if err != nil {
-		return fmt.Errorf("failed to parse DELETE tuple data: %w", err)
-	}
-
-	return wp.createChangeEvent("DELETE", "", relationID, nil, rowData, handler)
-}
-
-// parseTruncate parses TRUNCATE message
-func (wp *WALParser) parseTruncate(data []byte, handler *EventHandler) error {
-	if len(data) < 6 {
-		return fmt.Errorf("TRUNCATE message too short")
-	}
-
-	relationCount := binary.BigEndian.Uint32(data[0:4])
-
-	for i := uint32(0); i < relationCount; i++ {
-		offset := 4 + i*4
-		if len(data) < int(offset+4) {
-			break
-		}
-
-		relationID := binary.BigEndian.Uint32(data[offset : offset+4])
-		err := wp.createChangeEvent("TRUNCATE", "", relationID, nil, nil, handler)
-		if err != nil {
-			log.Printf("Failed to create TRUNCATE event for relation %d: %v", relationID, err)
-		}
-	}
-
-	return nil
-}
-
-// parseTupleData parses tuple data from WAL messages
-func (wp *WALParser) parseTupleData(data []byte, relationID uint32, tupleType byte) (*RowData, error) {
-	if len(data) < 2 {
-		return nil, fmt.Errorf("tuple data too short")
-	}
-
-	columnCount := binary.BigEndian.Uint16(data[0:2])
-	columns := make([]ColumnData, 0, columnCount)
 
 	relation := wp.relations[relationID]
 	if relation == nil {
 		return nil, fmt.Errorf("unknown relation ID: %d", relationID)
 	}
 
-	offset := 2
-	for i := uint16(0); i < columnCount && i < uint16(len(relation.Columns)); i++ {
-		if offset >= len(data) {
+	columns := make([]ColumnData, 0, len(tuple.Columns))
+	for idx, col := range tuple.Columns {
+		if idx >= len(relation.Columns) {
 			break
 		}
 
-		columnInfo := relation.Columns[i]
-		columnType := data[offset]
-		offset++
-
+		columnInfo := relation.Columns[idx]
 		var value interface{}
 		var isNull bool
 
-		switch columnType {
-		case 'n': // NULL value
+		switch col.DataType {
+		case pglogrepl.TupleDataTypeNull:
 			isNull = true
-			value = nil
-		case 't': // Text value
-			if offset+4 > len(data) {
-				break
-			}
-			length := binary.BigEndian.Uint32(data[offset : offset+4])
-			offset += 4
-
-			if offset+int(length) > len(data) {
-				break
-			}
-
-			value = string(data[offset : offset+int(length)])
-			offset += int(length)
-		case 'u': // Unchanged TOAST value
-			// Skip unchanged TOAST values
+		case pglogrepl.TupleDataTypeToast:
 			continue
+		case pglogrepl.TupleDataTypeText:
+			value = string(col.Data)
+		case pglogrepl.TupleDataTypeBinary:
+			value = col.Data
 		default:
-			log.Printf("Unknown column type: %c", columnType)
-			continue
+			return nil, fmt.Errorf("unknown tuple column type: %c", col.DataType)
 		}
 
 		columns = append(columns, ColumnData{
@@ -722,6 +522,407 @@ func (wp *WALParser) parseTupleData(data []byte, relationID uint32, tupleType by
 		TupleType:  tupleType,
 		Columns:    columns,
 	}, nil
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// parseBegin parses BEGIN transaction message
+func (wp *WALParser) parseBegin(data []byte) (int, error) {
+	if len(data) < 20 {
+		return 0, fmt.Errorf("BEGIN message too short")
+	}
+
+	finalLSN := binary.BigEndian.Uint64(data[0:8])
+	commitTime := int64(binary.BigEndian.Uint64(data[8:16]))
+	xid := binary.BigEndian.Uint32(data[16:20])
+
+	wp.currentTxn = &TransactionInfo{
+		XID:        xid,
+		CommitTime: time.Unix(commitTime/1000000, (commitTime%1000000)*1000),
+		FinalLSN:   fmt.Sprintf("%X/%X", uint32(finalLSN>>32), uint32(finalLSN)),
+	}
+
+	return 20, nil
+}
+
+// parseCommit parses COMMIT transaction message
+func (wp *WALParser) parseCommit(data []byte) (int, error) {
+	if len(data) < 25 {
+		return 0, fmt.Errorf("COMMIT message too short")
+	}
+
+	flags := data[0]
+	commitLSN := binary.BigEndian.Uint64(data[1:9])
+	endLSN := binary.BigEndian.Uint64(data[9:17])
+	commitTime := int64(binary.BigEndian.Uint64(data[17:25]))
+
+	if wp.currentTxn != nil {
+		wp.currentTxn.CommitLSN = formatLSN(commitLSN)
+		wp.currentTxn.FinalLSN = formatLSN(endLSN)
+		wp.currentTxn.CommitTime = time.Unix(commitTime/1000000, (commitTime%1000000)*1000)
+		_ = flags
+	}
+
+	// Reset current transaction
+	wp.currentTxn = nil
+
+	return 25, nil
+}
+
+// parseRelation parses RELATION message
+func (wp *WALParser) parseRelation(data []byte) (int, error) {
+	if len(data) < 7 {
+		return 0, fmt.Errorf("RELATION message too short")
+	}
+
+	relationID := binary.BigEndian.Uint32(data[0:4])
+	offset := 4
+
+	// Parse namespace (null-terminated string)
+	namespace, consumed, err := parseCString(data[offset:])
+	if err != nil {
+		return 0, fmt.Errorf("RELATION message: %w", err)
+	}
+	offset += consumed
+
+	// Parse relation name (null-terminated string)
+	relationName, consumed, err := parseCString(data[offset:])
+	if err != nil {
+		return 0, fmt.Errorf("RELATION message: %w", err)
+	}
+	offset += consumed
+
+	// Parse replica identity
+	if offset >= len(data) {
+		return 0, fmt.Errorf("RELATION message too short for replica identity")
+	}
+	replicaIdentity := data[offset]
+	offset++
+
+	// Parse column count
+	if offset+2 > len(data) {
+		return 0, fmt.Errorf("RELATION message too short for column count")
+	}
+	columnCount := binary.BigEndian.Uint16(data[offset : offset+2])
+	offset += 2
+
+	columns := make([]ColumnInfo, 0, columnCount)
+	primaryKeyCols := make([]string, 0)
+
+	for i := uint16(0); i < columnCount; i++ {
+		if offset+1 > len(data) {
+			return 0, fmt.Errorf("RELATION message too short while parsing column %d", i)
+		}
+
+		flags := data[offset]
+		offset++
+
+		// Parse column name (null-terminated string)
+		columnName, consumed, err := parseCString(data[offset:])
+		if err != nil {
+			return 0, fmt.Errorf("RELATION message column %d: %w", i, err)
+		}
+		offset += consumed
+
+		// Parse type ID and type mod
+		if offset+8 > len(data) {
+			return 0, fmt.Errorf("RELATION message too short for column %d type info", i)
+		}
+		typeID := binary.BigEndian.Uint32(data[offset : offset+4])
+		typeMod := int32(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
+		offset += 8
+
+		columns = append(columns, ColumnInfo{
+			Flags:   flags,
+			Name:    columnName,
+			TypeID:  typeID,
+			TypeMod: typeMod,
+		})
+		if flags&1 == 1 {
+			primaryKeyCols = append(primaryKeyCols, columnName)
+		}
+	}
+
+	wp.relations[relationID] = &RelationInfo{
+		RelationID:      relationID,
+		Namespace:       namespace,
+		RelationName:    relationName,
+		ReplicaIdentity: replicaIdentity,
+		Columns:         columns,
+		PrimaryKeyCols:  primaryKeyCols,
+	}
+
+	logger.Debug("Parsed RELATION: id=%d, schema=%s, table=%s, columns=%d",
+		relationID, namespace, relationName, len(columns))
+
+	return offset, nil
+}
+
+// parseInsert parses INSERT message
+func (wp *WALParser) parseInsert(data []byte, handler *EventHandler) (int, error) {
+	if len(data) < 5 {
+		return 0, fmt.Errorf("INSERT message too short")
+	}
+
+	relationID := binary.BigEndian.Uint32(data[0:4])
+	tupleType := data[4]
+
+	if tupleType != 'N' {
+		return 0, fmt.Errorf("unexpected tuple type for INSERT: %c", tupleType)
+	}
+
+	rowData, consumed, err := wp.parseTupleData(data[5:], relationID, tupleType)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse INSERT tuple data: %w", err)
+	}
+
+	if err := wp.createChangeEvent("INSERT", handler.currentLSN, relationID, rowData, nil, handler); err != nil {
+		return 0, err
+	}
+	return 5 + consumed, nil
+}
+
+// parseUpdate parses UPDATE message
+func (wp *WALParser) parseUpdate(data []byte, handler *EventHandler) (int, error) {
+	if len(data) < 5 {
+		return 0, fmt.Errorf("UPDATE message too short")
+	}
+
+	relationID := binary.BigEndian.Uint32(data[0:4])
+
+	var oldData, newData *RowData
+	var err error
+	offset := 4
+
+	// Parse old tuple (if present)
+	if offset < len(data) {
+		tupleType := data[offset]
+		offset++
+
+		if tupleType == 'O' || tupleType == 'K' {
+			var consumed int
+			oldData, consumed, err = wp.parseTupleData(data[offset:], relationID, tupleType)
+			if err != nil {
+				return 0, fmt.Errorf("failed to parse UPDATE old tuple data: %w", err)
+			}
+			offset += consumed
+			if offset >= len(data) || data[offset] != 'N' {
+				return 0, fmt.Errorf("UPDATE message missing new tuple marker")
+			}
+			offset++
+		} else if tupleType == 'N' {
+			var consumed int
+			newData, consumed, err = wp.parseTupleData(data[offset:], relationID, tupleType)
+			if err != nil {
+				return 0, fmt.Errorf("failed to parse UPDATE new tuple data: %w", err)
+			}
+			offset += consumed
+		} else {
+			return 0, fmt.Errorf("unexpected tuple type for UPDATE: %c", tupleType)
+		}
+	}
+
+	// Parse new tuple
+	if newData == nil && offset < len(data) {
+		var consumed int
+		newData, consumed, err = wp.parseTupleData(data[offset:], relationID, 'N')
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse UPDATE new tuple data: %w", err)
+		}
+		offset += consumed
+	}
+
+	if err := wp.createChangeEvent("UPDATE", handler.currentLSN, relationID, newData, oldData, handler); err != nil {
+		return 0, err
+	}
+	return offset, nil
+}
+
+// parseDelete parses DELETE message
+func (wp *WALParser) parseDelete(data []byte, handler *EventHandler) (int, error) {
+	if len(data) < 5 {
+		return 0, fmt.Errorf("DELETE message too short")
+	}
+
+	relationID := binary.BigEndian.Uint32(data[0:4])
+	tupleType := data[4]
+
+	if tupleType != 'O' && tupleType != 'K' {
+		return 0, fmt.Errorf("unexpected tuple type for DELETE: %c", tupleType)
+	}
+
+	rowData, consumed, err := wp.parseTupleData(data[5:], relationID, tupleType)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse DELETE tuple data: %w", err)
+	}
+
+	if err := wp.createChangeEvent("DELETE", handler.currentLSN, relationID, nil, rowData, handler); err != nil {
+		return 0, err
+	}
+	return 5 + consumed, nil
+}
+
+// parseTruncate parses TRUNCATE message
+func (wp *WALParser) parseTruncate(data []byte, handler *EventHandler) (int, error) {
+	if len(data) < 5 {
+		return 0, fmt.Errorf("TRUNCATE message too short")
+	}
+
+	relationCount := binary.BigEndian.Uint32(data[0:4])
+	offset := 5 // relationCount(4) + options(1)
+	if len(data) < offset+int(relationCount)*4 {
+		return 0, fmt.Errorf("TRUNCATE message too short for %d relations", relationCount)
+	}
+
+	for i := uint32(0); i < relationCount; i++ {
+		relationID := binary.BigEndian.Uint32(data[offset : offset+4])
+		err := wp.createChangeEvent("TRUNCATE", "", relationID, nil, nil, handler)
+		if err != nil {
+			log.Printf("Failed to create TRUNCATE event for relation %d: %v", relationID, err)
+		}
+		offset += 4
+	}
+
+	return offset, nil
+}
+
+// parseTupleData parses tuple data from WAL messages
+func (wp *WALParser) parseTupleData(data []byte, relationID uint32, tupleType byte) (*RowData, int, error) {
+	if len(data) < 2 {
+		return nil, 0, fmt.Errorf("tuple data too short")
+	}
+
+	columnCount := binary.BigEndian.Uint16(data[0:2])
+	columns := make([]ColumnData, 0, columnCount)
+
+	relation := wp.relations[relationID]
+	if relation == nil {
+		return nil, 0, fmt.Errorf("unknown relation ID: %d", relationID)
+	}
+
+	offset := 2
+	for i := uint16(0); i < columnCount && i < uint16(len(relation.Columns)); i++ {
+		if offset >= len(data) {
+			return nil, 0, fmt.Errorf("tuple data too short while parsing column %d", i)
+		}
+
+		columnInfo := relation.Columns[i]
+		columnType := data[offset]
+		offset++
+
+		var value interface{}
+		var isNull bool
+
+		switch columnType {
+		case 'n': // NULL value
+			isNull = true
+			value = nil
+		case 't': // Text value
+			if offset+4 > len(data) {
+				return nil, 0, fmt.Errorf("tuple data too short for text length")
+			}
+			length := binary.BigEndian.Uint32(data[offset : offset+4])
+			offset += 4
+
+			if offset+int(length) > len(data) {
+				return nil, 0, fmt.Errorf("tuple data too short for text payload")
+			}
+
+			value = string(data[offset : offset+int(length)])
+			offset += int(length)
+		case 'u': // Unchanged TOAST value
+			// Skip unchanged TOAST values
+			continue
+		default:
+			return nil, 0, fmt.Errorf("unknown tuple column type: %c", columnType)
+		}
+
+		columns = append(columns, ColumnData{
+			Name:     columnInfo.Name,
+			Value:    value,
+			IsNull:   isNull,
+			TypeID:   columnInfo.TypeID,
+			TypeName: columnInfo.TypeName,
+		})
+	}
+
+	if columnCount > uint16(len(relation.Columns)) {
+		return nil, 0, fmt.Errorf("tuple data has %d columns but relation %d only has %d columns",
+			columnCount, relationID, len(relation.Columns))
+	}
+
+	return &RowData{
+		RelationID: relationID,
+		TupleType:  tupleType,
+		Columns:    columns,
+	}, offset, nil
+}
+
+func parseCString(data []byte) (string, int, error) {
+	for i, b := range data {
+		if b == 0 {
+			return string(data[:i]), i + 1, nil
+		}
+	}
+	return "", 0, fmt.Errorf("cstring not null-terminated")
+}
+
+func parseOriginMessage(data []byte) (int, error) {
+	if len(data) < 8 {
+		return 0, fmt.Errorf("ORIGIN message too short")
+	}
+	_, consumed, err := parseCString(data[8:])
+	if err != nil {
+		return 0, err
+	}
+	return 8 + consumed, nil
+}
+
+func parseTypeMessage(data []byte) (int, error) {
+	if len(data) < 4 {
+		return 0, fmt.Errorf("TYPE message too short")
+	}
+
+	offset := 4
+	_, consumed, err := parseCString(data[offset:])
+	if err != nil {
+		return 0, err
+	}
+	offset += consumed
+
+	_, consumed, err = parseCString(data[offset:])
+	if err != nil {
+		return 0, err
+	}
+	offset += consumed
+
+	return offset, nil
+}
+
+func parseGenericMessage(data []byte) (int, error) {
+	if len(data) < 13 {
+		return 0, fmt.Errorf("MESSAGE message too short")
+	}
+	prefix, consumed, err := parseCString(data[9:])
+	if err != nil {
+		return 0, err
+	}
+	_ = prefix
+	lengthOffset := 9 + consumed
+	if len(data) < lengthOffset+4 {
+		return 0, fmt.Errorf("MESSAGE message too short for content length")
+	}
+	contentLength := int(binary.BigEndian.Uint32(data[lengthOffset : lengthOffset+4]))
+	if len(data) < lengthOffset+4+contentLength {
+		return 0, fmt.Errorf("MESSAGE message too short for content")
+	}
+	return lengthOffset + 4 + contentLength, nil
 }
 
 // createChangeEvent creates a change event from parsed WAL data
@@ -777,17 +978,18 @@ func (wp *WALParser) createChangeEvent(operation, lsn string, relationID uint32,
 		return fmt.Errorf("failed to marshal data to JSON: %w", err)
 	}
 
-	// Get primary key (simplified - would need proper primary key detection)
-	primaryKey := ""
-	if len(data.Columns) > 0 {
-		primaryKey = fmt.Sprintf("%v", data.Columns[0].Value)
+	primaryKey, err := extractPrimaryKey(data, relation)
+	if err != nil {
+		return fmt.Errorf("failed to extract primary key for %s.%s: %w", relation.Namespace, relation.RelationName, err)
 	}
 
 	// Create change event
 	changeEvent := &pb.ChangeEvent{
 		Op: operation,
 		Checkpoint: &pb.Checkpoint{
+			Position:    lsn,
 			PostgresLsn: lsn,
+			Timestamp:   time.Now().Unix(),
 		},
 		PrimaryKey: primaryKey,
 		Data:       string(jsonData),
@@ -797,75 +999,83 @@ func (wp *WALParser) createChangeEvent(operation, lsn string, relationID uint32,
 	return handler.stream.Send(changeEvent)
 }
 
-// parsePrimaryKeepalive parses a primary keepalive message
-func (wp *WALParser) parsePrimaryKeepalive(data []byte) error {
-	if len(data) < 17 {
-		return fmt.Errorf("primary keepalive message too short")
+func extractPrimaryKey(data *RowData, relation *RelationInfo) (string, error) {
+	if data == nil {
+		return "", fmt.Errorf("row data is nil")
 	}
 
-	// Parse keepalive data
-	walEnd := binary.BigEndian.Uint64(data[0:8])
-	sendTime := int64(binary.BigEndian.Uint64(data[8:16]))
-	replyRequested := data[16] != 0
+	if len(relation.PrimaryKeyCols) == 0 {
+		if len(data.Columns) == 0 {
+			return "", fmt.Errorf("no columns available")
+		}
+		return primaryKeyValueString(data.Columns[0].Value), nil
+	}
 
-	_ = sendTime
+	valuesByName := make(map[string]interface{}, len(data.Columns))
+	for _, col := range data.Columns {
+		valuesByName[col.Name] = col.Value
+	}
 
-	if replyRequested {
+	pkParts := make([]string, 0, len(relation.PrimaryKeyCols))
+	for _, colName := range relation.PrimaryKeyCols {
+		value, ok := valuesByName[colName]
+		if !ok {
+			return "", fmt.Errorf("primary key column %s not found in row data", colName)
+		}
+		pkParts = append(pkParts, primaryKeyValueString(value))
+	}
+
+	return strings.Join(pkParts, ":"), nil
+}
+
+func primaryKeyValueString(value interface{}) string {
+	switch v := value.(type) {
+	case []byte:
+		return string(v)
+	default:
+		return fmt.Sprintf("%v", value)
+	}
+}
+
+// parsePrimaryKeepalive parses a primary keepalive message
+func (wp *WALParser) parsePrimaryKeepalive(data []byte) error {
+	pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(data)
+	if err != nil {
+		return fmt.Errorf("failed to parse primary keepalive message: %w", err)
+	}
+
+	if pkm.ReplyRequested {
 		// Send standby status update
+		walEnd := uint64(pkm.ServerWALEnd)
 		return wp.sendStandbyStatusUpdate(context.Background(), walEnd, walEnd, walEnd)
 	}
 
 	return nil
 }
 
+func formatLSN(lsn uint64) string {
+	return fmt.Sprintf("%X/%X", uint32(lsn>>32), uint32(lsn))
+}
+
 // sendStandbyStatusUpdate sends a standby status update message
 func (wp *WALParser) sendStandbyStatusUpdate(ctx context.Context, received, flushed, applied uint64) error {
-	// Build standby status update message
-	msg := make([]byte, 34)
-	msg[0] = 'r' // Standby status update
-
-	// Set LSN positions
-	binary.BigEndian.PutUint64(msg[1:9], received)  // Last received LSN
-	binary.BigEndian.PutUint64(msg[9:17], flushed)  // Last flushed LSN
-	binary.BigEndian.PutUint64(msg[17:25], applied) // Last applied LSN
-
-	// Set timestamp (PostgreSQL epoch: 2000-01-01 00:00:00 UTC)
-	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-	now := time.Since(pgEpoch).Microseconds()
-	binary.BigEndian.PutUint64(msg[25:33], uint64(now))
-
-	msg[33] = 0 // Reply not requested
-
 	// Send the standby status update to PostgreSQL
 	log.Printf("Sending standby status update: received=%X/%X, flushed=%X/%X, applied=%X/%X",
 		uint32(received>>32), uint32(received),
 		uint32(flushed>>32), uint32(flushed),
 		uint32(applied>>32), uint32(applied))
 
-	// Send CopyData message with standby status update using correct method
-	// Create a CopyData message and send it via the connection
-	copyData := &pgproto3.CopyData{Data: msg}
-
-	// Convert to wire format and send
-	buf := make([]byte, 0, len(msg)+5)
-	var err error
-	buf, err = copyData.Encode(buf)
-	if err != nil {
-		return fmt.Errorf("failed to encode standby status update: %w", err)
-	}
-
 	// Check context before writing
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("context cancelled before sending standby status: %w", err)
 	}
 
-	// Write directly to the connection
-	_, err = wp.conn.Conn().Write(buf)
-	if err != nil {
-		return fmt.Errorf("failed to send standby status update: %w", err)
-	}
-
-	return nil
+	return pglogrepl.SendStandbyStatusUpdate(ctx, wp.conn, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: pglogrepl.LSN(received),
+		WALFlushPosition: pglogrepl.LSN(flushed),
+		WALApplyPosition: pglogrepl.LSN(applied),
+		ClientTime:       time.Now(),
+	})
 }
 
 // parseLSNToUint64 converts PostgreSQL LSN string format (e.g., "0/19A6E88") to uint64

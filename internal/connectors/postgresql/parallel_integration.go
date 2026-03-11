@@ -16,10 +16,11 @@ import (
 
 // PostgreSQLSnapshotAdapter adapts PostgreSQL connector to work with parallel snapshot manager
 type PostgreSQLSnapshotAdapter struct {
-	config       *PostgreSQLConfig
-	pool         *ManagedPool
-	typeMapper   *AdvancedTypeMapper
-	dbConnection *sql.DB
+	config                  *PostgreSQLConfig
+	pool                    *ManagedPool
+	typeMapper              *AdvancedTypeMapper
+	dbConnection            *sql.DB
+	preferredConsistencyLSN string
 }
 
 // PostgreSQLConfig contains configuration specific to PostgreSQL snapshots
@@ -41,6 +42,11 @@ func NewPostgreSQLSnapshotAdapter(config *PostgreSQLConfig, pool *ManagedPool, t
 		pool:       pool,
 		typeMapper: typeMapper,
 	}
+}
+
+// SetPreferredConsistencyLSN allows snapshot callers to reuse a slot-aligned LSN.
+func (psa *PostgreSQLSnapshotAdapter) SetPreferredConsistencyLSN(lsn string) {
+	psa.preferredConsistencyLSN = lsn
 }
 
 // Initialize sets up the adapter for parallel snapshot processing
@@ -166,6 +172,11 @@ func (psa *PostgreSQLSnapshotAdapter) GetTableInfo(ctx context.Context, tableNam
 
 // CreateTableChunks creates chunks for parallel processing of a table
 func (psa *PostgreSQLSnapshotAdapter) CreateTableChunks(ctx context.Context, tableInfo *parallel.TableInfo, chunkSize int) ([]*parallel.ChunkInfo, error) {
+	if tableInfo.EstimatedRows == 0 {
+		log.Printf("Table %s is empty, no snapshot chunks created", tableInfo.Name)
+		return []*parallel.ChunkInfo{}, nil
+	}
+
 	if len(tableInfo.PrimaryKey) == 0 {
 		// No primary key - create single chunk
 		return []*parallel.ChunkInfo{
@@ -395,6 +406,10 @@ func (psa *PostgreSQLSnapshotAdapter) quoteName(name string) string {
 
 // GetSnapshotConsistencyPoint returns a consistency point for the snapshot
 func (psa *PostgreSQLSnapshotAdapter) GetSnapshotConsistencyPoint(ctx context.Context) (string, error) {
+	if psa.preferredConsistencyLSN != "" {
+		return psa.preferredConsistencyLSN, nil
+	}
+
 	// Start a repeatable read transaction to get a consistent snapshot
 	tx, err := psa.dbConnection.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelRepeatableRead,

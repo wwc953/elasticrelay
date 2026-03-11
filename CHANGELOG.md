@@ -2,9 +2,9 @@
 
 ## [v1.4.4] - 2026-03-11
 
-### 🔧 PostgreSQL Snapshot-to-CDC Continuity Fix
+### 🔧 PostgreSQL Snapshot-to-CDC and CDC Stability Fixes
 
-This release fixes a PostgreSQL synchronization gap where an initial snapshot could finish successfully, but CDC would restart from the current WAL position instead of the snapshot consistency point, causing inserts generated during the handoff window to be missed.
+This release fixes three classes of PostgreSQL synchronization issues: one during the snapshot-to-CDC handoff, where rows created in the transition window could be missed; one during sustained CDC catch-up, where downstream batch processing could stall WAL consumption and stop replication progress; and one where snapshot and CDC used different replication slots, causing part of the incremental WAL window to become unreadable.
 
 ### 🐛 Bug Fixes
 
@@ -35,6 +35,95 @@ This release fixes a PostgreSQL synchronization gap where an initial snapshot co
 - **Fix**: Captured one `consistencyLSN` for the snapshot and attached the same value to every emitted chunk
 - **Impact**: Snapshot completion and CDC startup now share one stable PostgreSQL handoff point
 
+#### 4. PostgreSQL CDC Async Batch Decoupling (`internal/orchestrator/multi_orchestrator.go`)
+
+**Fixed the replication reader being blocked by downstream batch processing:**
+
+- **Issue**: After PostgreSQL CDC events entered the orchestrator, they could synchronously trigger `transform -> sink -> checkpoint`, so slow Elasticsearch or Transform processing would also block WAL consumption
+- **Root Cause**: `jobCDCStream.Send()` fed directly into the batch processing path, coupling logical replication reads with downstream writes in one execution chain
+- **Fix**: Added an asynchronous `cdcEvents` queue and a dedicated batch worker for `MultiJob`, so the replication path now only enqueues events and returns quickly
+- **Impact**: Long-running high-volume incremental syncs are much less likely to stall because of sink-side latency
+
+#### 5. PostgreSQL CDC Event LSN Propagation (`internal/connectors/postgresql/wal_parser.go`)
+
+**Fixed CDC events being emitted without the real WAL checkpoint position:**
+
+- **Issue**: INSERT/UPDATE/DELETE events could be emitted with an empty `Checkpoint.PostgresLsn`, leaving incremental checkpoints without a reliable resume position
+- **Root Cause**: The WAL parser read `walStart/walEnd` from `XLogData`, but did not propagate that LSN into the emitted `ChangeEvent` checkpoint
+- **Fix**: Tracked the current WAL LSN while parsing `XLogData`, then wrote it into both `Position` and `PostgresLsn` on CDC events
+- **Impact**: PostgreSQL CDC checkpoints now carry the real WAL position, making resume, catch-up, and troubleshooting more reliable
+
+#### 6. PostgreSQL Job-Scoped Replication Slot Reuse (`internal/connectors/postgresql/postgresql.go`)
+
+**Fixed snapshot and CDC running against different replication slots:**
+
+- **Issue**: The PostgreSQL connector previously generated slot names from timestamps, so snapshot and CDC phases often ran against different replication slots
+- **Root Cause**: Slot lifecycle was tied to connector startup rather than job identity, so CDC startup could create a fresh temporary slot unrelated to the snapshot handoff context
+- **Fix**: Changed PostgreSQL slot naming to a stable `jobId`-scoped slot and reused that same slot during CDC startup
+- **Impact**: Each synchronization job now stays on one replication slot across snapshot and CDC, making handoff behavior much more predictable
+
+#### 7. Replication Slot Pre-Creation Before Snapshot (`internal/connectors/postgresql/postgresql.go`, `internal/connectors/postgresql/parallel_integration.go`)
+
+**Fixed CDC appearing to catch up early after only part of the incremental data was synced:**
+
+- **Issue**: Even with a seemingly valid checkpoint, CDC could stop after syncing only part of the incremental workload and then continue sending keepalives without new changes
+- **Root Cause**: The replication slot used to be created only when CDC started, so that slot could only see WAL retained after its own creation, not the full window between snapshot completion and CDC handoff
+- **Fix**: Pre-created the publication and the job-scoped slot during `BeginSnapshot`, then made the snapshot adapter reuse that slot-aligned LSN and kept CDC on the same slot afterward
+- **Impact**: Snapshot and CDC now share the same slot context, significantly reducing cases where only a subset of incremental WAL can be consumed
+
+#### 8. PostgreSQL Logical Message Reassembly and Full Payload Parsing (`internal/connectors/postgresql/wal_parser.go`)
+
+**Fixed CDC dropping rows when `pgoutput` messages arrived fragmented or packed together:**
+
+- **Issue**: After large PostgreSQL inserts, Elasticsearch often received only part of the rows, and CDC could stop around a few thousand records
+- **Root Cause**: The WAL parser did not reliably handle fragmented logical replication messages or multiple logical messages delivered in one WAL payload
+- **Fix**: Added buffered logical message reassembly, processed all messages in a payload instead of only the first one, and hardened incomplete-message handling
+- **Impact**: PostgreSQL CDC can now consume sustained high-volume insert streams much more reliably without silently losing part of the batch
+
+#### 9. PostgreSQL CDC Primary Key Extraction Fix (`internal/connectors/postgresql/postgresql.go`, `internal/connectors/postgresql/wal_parser.go`)
+
+**Fixed CDC events using wrong or unstable primary keys:**
+
+- **Issue**: Some PostgreSQL CDC events generated duplicate or malformed document IDs such as repeated low values or byte-style strings, causing Elasticsearch documents to overwrite each other
+- **Root Cause**: CDC primary key extraction relied on fragile assumptions about the first column and did not consistently use the table's real primary key metadata
+- **Fix**: Loaded actual PostgreSQL primary key columns from schema metadata, extracted primary keys by column name, and normalized byte-backed values before building document IDs
+- **Impact**: PostgreSQL CDC now produces stable Elasticsearch `_id` values, preventing row loss caused by accidental overwrites
+
+#### 10. PostgreSQL Replication Connection Concurrency Fix (`internal/connectors/postgresql/wal_parser.go`)
+
+**Fixed protocol desynchronization during CDC streaming:**
+
+- **Issue**: PostgreSQL CDC intermittently failed with parse errors such as `unsupported logical replication message` or `unknown copy data message type`, and synchronization repeatedly stalled at partial counts
+- **Root Cause**: The replication connection was used concurrently for message reads and keepalive writes, which is unsafe for the underlying PostgreSQL connection implementation
+- **Fix**: Refactored the WAL processing loop into a single-threaded receive/send model and updated timeout handling to treat expected polling timeouts correctly
+- **Impact**: PostgreSQL CDC now maintains protocol alignment under load, eliminating the recurring partial-sync failures caused by stream corruption
+
+#### 11. PostgreSQL Force-Initial-Sync Cleanup and CDC Restart Safety (`internal/connectors/postgresql/postgresql.go`, `internal/orchestrator/multi_orchestrator.go`)
+
+**Improved recovery from failed or dirty PostgreSQL CDC runs:**
+
+- **Issue**: After deleting checkpoints, rebuilding tables, or restarting from a failed state, PostgreSQL jobs could still resume from stale slot state or replay buffered in-memory CDC events
+- **Root Cause**: Inactive replication slots were not automatically reset for forced re-sync, and the orchestrator could retain pending CDC batches across restart attempts
+- **Fix**: Added automatic cleanup of inactive PostgreSQL replication slots for `force_initial_sync` and cleared in-memory CDC batch/queue state before restarting the CDC loop
+- **Impact**: Re-runs after failures or environment resets are now more predictable and less likely to replay stale state
+
+#### 12. Empty PostgreSQL Table Snapshot Guard (`internal/connectors/postgresql/parallel_integration.go`)
+
+**Fixed parallel snapshot initialization for empty tables:**
+
+- **Issue**: PostgreSQL parallel snapshot setup could error when a selected table currently had zero rows
+- **Fix**: Skipped chunk creation for tables whose estimated row count is zero
+- **Impact**: Empty tables no longer break the PostgreSQL snapshot phase
+
+#### 13. Checkpoint Commit Noise Reduction (`internal/connectors/postgresql/postgresql.go`, `internal/connectors/postgresql/lsn_manager.go`, `internal/orchestrator/multi_orchestrator.go`)
+
+**Reduced unnecessary checkpoint overhead after the CDC stability fixes:**
+
+- **Issue**: Once PostgreSQL CDC became stable, checkpoint commits generated excessive log noise and redundant persistence work during high-throughput batches
+- **Root Cause**: Every batch flush could trigger a checkpoint gRPC call, successful commits were logged repeatedly, and the PostgreSQL checkpoint service created an unused database pool even though checkpoint persistence only writes to the local file
+- **Fix**: Removed the unused checkpoint DB pool creation, suppressed repetitive success logs, skipped commits when the position had not changed, and throttled checkpoint persistence to at most once per commit interval
+- **Impact**: PostgreSQL checkpoint progression remains intact while runtime logs and checkpoint overhead are significantly reduced
+
 ### ✅ Verification
 
 After this fix:
@@ -42,13 +131,19 @@ After this fix:
 - PostgreSQL jobs keep their existing MySQL and MongoDB behavior unchanged
 - Snapshot records and CDC startup use the same PostgreSQL LSN handoff point
 - PostgreSQL checkpoint logs show a real LSN instead of MySQL-style placeholder output
+- PostgreSQL WAL reads and downstream batch writes are now decoupled, improving CDC stability under load
+- PostgreSQL snapshot and CDC now reuse the same job-scoped replication slot, reducing incremental data loss across the handoff window
+- PostgreSQL CDC now completes large insert verification runs without reproducing the earlier 3k-4k partial-sync ceiling
+- PostgreSQL checkpoint persistence continues to advance while producing much less runtime log noise
 
 Validation performed:
 
-- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/connectors/postgresql/parallel_integration.go`
+- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/connectors/postgresql/postgresql.go internal/connectors/postgresql/parallel_integration.go internal/connectors/postgresql/wal_parser.go`
 - `go test -run '^$' ./internal/orchestrator ./internal/connectors/postgresql`
-- `go test ./internal/orchestrator ./internal/connectors/postgresql`
-  Note: package compilation passed; the failing assertions came from pre-existing `lsn_manager_test` cases unrelated to this change.
+  Note: targeted package compilation passed.
+- `go test ./internal/connectors/postgresql -run 'TestParseLogicalMessage_ProcessesAllMessagesInBuffer|TestParseXLogData_ReassemblesFragmentedLogicalMessages|TestProcessBufferedLogicalMessages_FailsOnUnexpectedByte|TestCreateChangeEvent_UsesConfiguredPrimaryKeyColumn'`
+  Note: targeted WAL parser regression tests passed.
+- Manual verification: insert 10,000 rows into PostgreSQL and confirm Elasticsearch `count` reaches `10000` without duplicate-primary-key warnings or replication parse errors.
 
 ---
 

@@ -207,7 +207,6 @@ func (lm *LSNManager) SaveCheckpoint(checkpoint *LSNCheckpoint) error {
 		return fmt.Errorf("failed to write checkpoint file: %w", err)
 	}
 
-	log.Printf("Saved checkpoint for job %s at LSN %s", checkpoint.JobID, checkpoint.LSN)
 	return nil
 }
 

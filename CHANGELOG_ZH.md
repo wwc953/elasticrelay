@@ -2,9 +2,9 @@
 
 ## [v1.4.4] - 2026-03-11
 
-### 🔧 PostgreSQL 快照到 CDC 衔接修复
+### 🔧 PostgreSQL 快照到 CDC 衔接与稳定性修复
 
-此版本修复了 PostgreSQL 同步链路中的一个断档问题：初始快照虽然可以正常完成，但切换到 CDC 时会从“当前 WAL 位置”重新开始，而不是从快照一致性点继续，导致快照与 CDC 切换窗口内产生的插入数据被遗漏。
+此版本修复了 PostgreSQL 同步链路中的三类问题：一类发生在初始快照切换到 CDC 时，可能导致切换窗口内的数据遗漏；一类发生在 CDC 持续追平期间，下游批处理阻塞 WAL 消费，导致长时间增量同步时出现停滞；还有一类发生在 snapshot 与 CDC 使用不同 replication slot 时，导致部分增量 WAL 无法继续追平。
 
 ### 🐛 问题修复
 
@@ -35,6 +35,95 @@
 - **修复：** 在快照开始时捕获一次 `consistencyLSN`，并将同一个值附加到所有输出 chunk
 - **影响：** 快照完成点与 CDC 启动点现在共享同一个稳定的 PostgreSQL 衔接位点
 
+#### 4. PostgreSQL CDC 异步批处理解耦 (`internal/orchestrator/multi_orchestrator.go`)
+
+**修复 CDC 读取线程被下游批量写入阻塞的问题：**
+
+- **问题：** PostgreSQL CDC 事件在进入编排层后，会同步触发 `transform -> sink -> checkpoint`，当 Elasticsearch 或 Transform 处理变慢时，WAL 消费线程会被一起卡住
+- **根本原因：** `jobCDCStream.Send()` 直接走批处理路径，导致 PG 逻辑复制读取与下游写入耦合在同一条执行链上
+- **修复：** 为 `MultiJob` 增加异步 `cdcEvents` 队列和专用批处理 worker，让复制线程只负责快速收包和入队
+- **影响：** 长时间大批量增量同步时，WAL 接收不会再轻易被 ES/Transform 延迟拖停，PG CDC 稳定性明显提升
+
+#### 5. PostgreSQL CDC 事件真实 LSN 写入修复 (`internal/connectors/postgresql/wal_parser.go`)
+
+**修复 CDC 事件 checkpoint 缺少真实 WAL 位点的问题：**
+
+- **问题：** INSERT/UPDATE/DELETE 事件写出的 `Checkpoint.PostgresLsn` 可能为空，导致增量阶段的 checkpoint 缺乏有效恢复位点
+- **根本原因：** WAL 解析器虽然拿到了 `XLogData` 中的 `walStart/walEnd`，但在创建 `ChangeEvent` 时没有把真实 LSN 继续传到事件 checkpoint
+- **修复：** 在解析 `XLogData` 时维护当前 WAL LSN，并在 CDC 事件中同时写入 `Position` 和 `PostgresLsn`
+- **影响：** PostgreSQL CDC checkpoint 现在会携带真实 WAL 位点，恢复、追平和问题排查都更可靠
+
+#### 6. PostgreSQL job 级固定 replication slot 修复 (`internal/connectors/postgresql/postgresql.go`)
+
+**修复 snapshot 与 CDC 使用不同 slot 导致增量窗口丢失的问题：**
+
+- **问题：** PostgreSQL connector 之前使用时间戳动态生成 slot 名，导致快照阶段和 CDC 阶段常常不是同一个 replication slot
+- **根本原因：** slot 生命周期和 job 生命周期脱节，CDC 启动时会重新创建新的临时 slot，无法承接快照阶段对应的 WAL 上下文
+- **修复：** 将 PostgreSQL slot 改为按 `jobId` 稳定命名，并在后续 CDC 启动时复用同一个 slot
+- **影响：** 同一个同步任务现在会持续使用同一 replication slot，快照到 CDC 的位点衔接更加稳定
+
+#### 7. PostgreSQL 快照前预建 slot 并复用 LSN (`internal/connectors/postgresql/postgresql.go`, `internal/connectors/postgresql/parallel_integration.go`)
+
+**修复 CDC 只追到部分增量后提前“追平”的问题：**
+
+- **问题：** 即使 checkpoint 看起来正确，CDC 也可能只能同步到部分增量数据，随后只剩 keepalive 不再继续前进
+- **根本原因：** 之前是在 CDC 启动时才创建 slot，导致 slot 只能看到创建之后的 WAL，而快照完成到 CDC 启动之间的一段增量可能永远不在该 slot 的消费范围内
+- **修复：** 在 `BeginSnapshot` 阶段先创建 publication 和同名 slot，并让 snapshot adapter 优先复用该 slot 对应的 LSN；CDC 阶段再继续使用同一个 slot
+- **影响：** snapshot 与 CDC 现在共享同一个 slot 上下文，显著减少“只同步几万条后就无更多 WAL 可读”的问题
+
+#### 8. PostgreSQL 逻辑消息重组与完整 payload 解析 (`internal/connectors/postgresql/wal_parser.go`)
+
+**修复 `pgoutput` 消息分片或合并时 CDC 丢行的问题：**
+
+- **问题：** PostgreSQL 大批量插入后，Elasticsearch 往往只能收到部分数据，CDC 常常停在几千条附近
+- **根本原因：** WAL 解析器没有稳定处理被拆分的逻辑复制消息，也没有完整处理一个 WAL payload 中连续出现的多条逻辑消息
+- **修复：** 增加逻辑消息缓冲重组能力，改为处理一个 payload 中的全部消息，并增强不完整消息的处理逻辑
+- **影响：** PostgreSQL CDC 现在可以更稳定地消费大批量插入流，不再因为消息边界处理不完整而静默丢失部分数据
+
+#### 9. PostgreSQL CDC 主键提取修复 (`internal/connectors/postgresql/postgresql.go`, `internal/connectors/postgresql/wal_parser.go`)
+
+**修复 CDC 事件使用错误或不稳定主键的问题：**
+
+- **问题：** 部分 PostgreSQL CDC 事件会生成重复或异常的文档 ID，例如重复小值或字节串样式字符串，导致 Elasticsearch 文档互相覆盖
+- **根本原因：** CDC 主键提取依赖“第一列”这样的脆弱假设，没有持续使用表的真实主键元数据
+- **修复：** 从 PostgreSQL schema 元数据中读取真实主键列，按列名提取主键值，并在生成文档 ID 前统一处理 `[]byte` 等字节值
+- **影响：** PostgreSQL CDC 现在会稳定生成正确的 Elasticsearch `_id`，避免因误覆盖造成的数据丢失
+
+#### 10. PostgreSQL 复制连接并发安全修复 (`internal/connectors/postgresql/wal_parser.go`)
+
+**修复 CDC 流过程中协议错位的问题：**
+
+- **问题：** PostgreSQL CDC 会间歇性报出 `unsupported logical replication message`、`unknown copy data message type` 等解析错误，并反复卡在部分同步数量
+- **根本原因：** 复制连接被并发用于“读取消息”和“发送 keepalive”，而底层 PostgreSQL 连接实现并不支持这种并发访问方式
+- **修复：** 将 WAL 处理循环重构为单线程收发模型，并修正超时识别逻辑，把正常轮询超时视为预期行为
+- **影响：** PostgreSQL CDC 在高负载下也能保持协议流对齐，消除了此前反复出现的部分同步失败
+
+#### 11. PostgreSQL 强制初始同步清理与 CDC 重启安全性改进 (`internal/connectors/postgresql/postgresql.go`, `internal/orchestrator/multi_orchestrator.go`)
+
+**改进 PostgreSQL CDC 在失败重跑和脏状态下的恢复能力：**
+
+- **问题：** 删除 checkpoint、重建表，或从失败状态重启后，PostgreSQL 任务仍可能沿用陈旧 slot 状态，或者重放内存中残留的 CDC 事件
+- **根本原因：** `force_initial_sync` 没有自动清理失活 replication slot，编排层在 CDC 重启时也可能保留之前积压的 batch 和队列数据
+- **修复：** 为 `force_initial_sync` 增加失活 PostgreSQL slot 的自动清理，并在 CDC 重启前清空内存中的 batch 和事件队列
+- **影响：** 故障恢复、环境重置后的重跑行为更可预期，也更不容易混入陈旧状态
+
+#### 12. 空 PostgreSQL 表快照保护 (`internal/connectors/postgresql/parallel_integration.go`)
+
+**修复空表导致并行快照初始化报错的问题：**
+
+- **问题：** 当选中的 PostgreSQL 表当前没有数据时，并行快照初始化可能直接报错
+- **修复：** 对估算行数为 0 的表跳过 chunk 创建
+- **影响：** 空表不再中断 PostgreSQL 初始快照流程
+
+#### 13. Checkpoint 提交降噪与节流 (`internal/connectors/postgresql/postgresql.go`, `internal/connectors/postgresql/lsn_manager.go`, `internal/orchestrator/multi_orchestrator.go`)
+
+**在 CDC 稳定后进一步降低 checkpoint 的额外开销：**
+
+- **问题：** PostgreSQL CDC 修复稳定后，高吞吐批处理期间 checkpoint 仍然会产生大量日志和重复持久化操作
+- **根本原因：** 每次 batch flush 都可能触发一次 checkpoint gRPC 调用，成功提交日志会不断刷屏，而 PostgreSQL checkpoint 服务虽然只写本地文件，却仍然额外创建了一个无实际用途的数据库连接池
+- **修复：** 去掉无用的 checkpoint 数据库连接池创建，移除重复的成功日志；当 checkpoint 位置未变化时不再重复提交，并将 checkpoint 持久化节流为每个 `commitInterval` 最多一次
+- **影响：** PostgreSQL checkpoint 仍会持续推进，但运行日志明显更干净，checkpoint 额外开销也更低
+
 ### ✅ 验证
 
 修复后：
@@ -42,13 +131,19 @@
 - PostgreSQL 修复路径不会改变现有 MySQL 和 MongoDB 的行为
 - 快照记录与 CDC 启动会使用同一个 PostgreSQL LSN 衔接点
 - PostgreSQL checkpoint 日志会显示真实 LSN，而不是 MySQL 风格的占位输出
+- PostgreSQL WAL 读取和下游批量写入已解耦，长时间增量同步更不容易中途停住
+- PostgreSQL snapshot 和 CDC 现在会复用同一个 job 级 replication slot，避免因 slot 切换造成增量窗口丢失
+- PostgreSQL CDC 在大批量插入验证中，不再复现之前只同步 3k-4k 条就停住的问题
+- PostgreSQL checkpoint 文件仍会正常推进，但运行时日志噪音显著减少
 
 已执行验证：
 
-- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/connectors/postgresql/parallel_integration.go`
+- `gofmt -w internal/orchestrator/multi_orchestrator.go internal/connectors/postgresql/postgresql.go internal/connectors/postgresql/parallel_integration.go internal/connectors/postgresql/wal_parser.go`
 - `go test -run '^$' ./internal/orchestrator ./internal/connectors/postgresql`
-- `go test ./internal/orchestrator ./internal/connectors/postgresql`
-  说明：包级编译已通过；失败断言来自仓库中原本存在的 `lsn_manager_test`，与本次修改无关。
+  说明：定向编译已通过。
+- `go test ./internal/connectors/postgresql -run 'TestParseLogicalMessage_ProcessesAllMessagesInBuffer|TestParseXLogData_ReassemblesFragmentedLogicalMessages|TestProcessBufferedLogicalMessages_FailsOnUnexpectedByte|TestCreateChangeEvent_UsesConfiguredPrimaryKeyColumn'`
+  说明：定向 WAL 解析回归测试已通过。
+- 手工验证：向 PostgreSQL 插入 10,000 条数据后，确认 Elasticsearch `count` 达到 `10000`，且不再出现重复主键告警或复制协议解析错误。
 
 ---
 
