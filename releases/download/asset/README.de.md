@@ -3,7 +3,7 @@
 ![ElasticRelay Screenshot](/releases/download/asset/screenshot_02.png)
 
 <p align="center">
-  <a href="https://github.com/yogoosoft/ElasticRelay/releases"><img src="https://img.shields.io/badge/version-v1.3.1-blue.svg" alt="Version"></a>
+  <a href="https://github.com/yogoosoft/ElasticRelay/releases"><img src="https://img.shields.io/badge/version-v1.4.4-blue.svg" alt="Version"></a>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/go-1.25.2+-00ADD8.svg" alt="Go Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="Lizenz"></a>
 </p>
@@ -20,25 +20,28 @@
 
 ElasticRelay ist ein nahtloser, heterogener Daten-Synchronisierer, der entwickelt wurde, um Echtzeit-Change Data Capture (CDC) von wichtigen OLTP-Datenbanken (MySQL, PostgreSQL, MongoDB) zu Elasticsearch bereitzustellen. Es zielt darauf ab, benutzerfreundlicher und zuverlässiger als bestehende Lösungen wie Logstash oder Flink zu sein.
 
-## 🎉 v1.3.1 Highlights - Multi-Source CDC Plattform
+## 🎉 v1.4.4 Highlights - Produktionsreife CDC-Plattform mit Transform Engine
 
-**Drei Hauptdatenbankquellen vollständig unterstützt:**
+**Drei Hauptdatenbankquellen und Enterprise-Datentransformation:**
 
 | Quelle | Status | Funktionen |
 |--------|--------|----------|
 | **MySQL** | ✅ Vollständig | Binlog CDC + Initial Sync + Parallele Snapshots |
-| **PostgreSQL** | ✅ Vollständig | Logische Replikation + WAL-Parsing + LSN-Verwaltung |
+| **PostgreSQL** | ✅ Produktionsgehärtet | Logische Replikation + WAL-Parsing + Stabiler Snapshot-zu-CDC-Übergang |
 | **MongoDB** | ✅ Vollständig | Change Streams + Sharded Clusters + Resume Tokens |
+| **Transform Engine** | ✅ Vollständig | Feld-Mapping + Datenmaskierung + Typkonvertierung + Ausdrucks-Engine |
 
 ## Hauptfunktionen
 
 - **Multi-Source CDC**: Vollständige Unterstützung für MySQL, PostgreSQL und MongoDB mit Echtzeit-Änderungserfassung
+- **Transform Engine**: Enterprise-Datentransformation mit Feld-Mapping, Datenmaskierung (Telefon, Ausweis, E-Mail, Bankkarte), Typkonvertierung, Ausdrucksauswertung und bedingter Filterung — Verarbeitung mit 800.000+ Ops/Sek
 - **Zero-Code Konfiguration**: JSON-basierte Konfiguration mit Assistenten-GUI (in Entwicklung)
 - **Multi-Table Dynamische Indexierung**: Erstellt automatisch separate Elasticsearch-Indizes für jede Quelltabelle mit konfigurierbaren Namensmustern (z.B. `elasticrelay-users`, `elasticrelay-orders`)
 - **Eingebaute Governance**: Handhabt Datenstrukturierung, Anonymisierung, Typkonvertierung, Normalisierung und Anreicherung
 - **Zuverlässigkeit von Anfang an**: Nutzt CDC auf Transaktionslog-Ebene, präzises Checkpointing für Wiederaufnahme und idempotente Schreibvorgänge zur Sicherstellung der Datenintegrität
 - **Dead Letter Queue (DLQ)**: Umfassende Fehlerbehandlung mit exponentiellem Backoff-Retry und persistentem Speicher
 - **Parallele Verarbeitung**: Erweiterte parallele Snapshot-Verarbeitung mit Chunking-Strategien für große Tabellen
+- **Zentralisiertes Logging**: Zur Laufzeit konfigurierbare Log-Level (debug/info/warn/error) mit thread-sicherer globaler Steuerung
 
 ## Technologie-Stack
 
@@ -47,22 +50,26 @@ ElasticRelay ist ein nahtloser, heterogener Daten-Synchronisierer, der entwickel
 - **APIs (gRPC)**: Interne Kommunikation zwischen Komponenten wird über gRPC für hohe Leistung mit vollständigen Service-Implementierungen abgewickelt.
 - **Datenbankunterstützung**: 
   - **MySQL CDC**: Erweitertes Binlog-Parsing mit Echtzeit-Synchronisierung (go-mysql Bibliothek)
-  - **PostgreSQL CDC**: Logische Replikation mit WAL-Parsing, Replikationsslots und Publications
+  - **PostgreSQL CDC**: Logische Replikation mit WAL-Parsing, Replikationsslots, Publications, und produktionsgehärteter Snapshot-zu-CDC-Übergang
   - **MongoDB CDC**: Change Streams mit Replica Set und Sharded Cluster Unterstützung (mongo-driver)
+- **Transform Engine**: Vollständige Datentransformations-Pipeline mit Feld-Mapping, Typkonvertierung, Datenmaskierung (4 Strategien, 5 Vorlagen), Ausdrucks-Engine (16 eingebaute Funktionen) und bedingter Filterung (10 Operatoren)
 - **Elasticsearch Integration**: Offizieller Elasticsearch Go-Client (v8) mit Bulk-Indexierungsunterstützung
 - **Konfiguration**: JSON-basierte Konfiguration mit automatischer Formaterkennung und Migration
 - **Zuverlässigkeit**: Umfassende Fehlerbehandlung, DLQ-System und Checkpoint-Verwaltung
+- **Logging**: Zentralisiertes Log-Level-Kontrollsystem mit Laufzeitkonfiguration
 
 ## Architektur
 
 Das System besteht aus mehreren Schlüsselkomponenten:
 
-- **Source Connectors**: Erfassen Änderungen aus Quelldatenbanken.
-- **Durable Buffer**: Ein persistenter Puffer zur Entkopplung von Quellen und Senken und zur Ermöglichung von Replay-Fähigkeit.
-- **Transform & Governance Engine**: Führt Datentransformationsregeln aus.
-- **ES Sink Writer**: Schreibt Daten effizient in Batches nach Elasticsearch.
-- **Orchestrator**: Verwaltet den Lebenszyklus von Synchronisierungsaufgaben.
-- **Control Plane**: Die Benutzeroberfläche und das Konfigurationsmanagement-Backend.
+- **Source Connectors**: Erfassen Änderungen aus MySQL (Binlog), PostgreSQL (logische Replikation) und MongoDB (Change Streams).
+- **Durable Buffer**: Asynchrone CDC-Ereigniswarteschlange zur Entkopplung von Quellen-Lesevorgängen und nachgelagerter Verarbeitung.
+- **Transform Engine**: Enterprise-Datentransformations-Pipeline mit Feld-Mapping, Typkonvertierung, Datenmaskierung, Ausdrucksauswertung und bedingter Filterung.
+- **ES Sink Writer**: Schreibt Daten effizient in Batches nach Elasticsearch mit automatischer Indexverwaltung.
+- **Orchestrator**: Verwaltet den Lebenszyklus von Synchronisierungsaufgaben und unterstützt sowohl Legacy-Einzelquellen- als auch Multi-Source-Konfigurationen.
+- **Dead Letter Queue**: Behandelt fehlgeschlagene Events mit exponentiellem Backoff-Retry und persistentem Speicher.
+- **Checkpoint Manager**: Persistente Positionsverfolgung (Binlog-Positionen, PostgreSQL LSN, MongoDB Resume Tokens) für fehlertolerante Wiederaufnahme.
+- **Control Plane**: Die Benutzeroberfläche und das Konfigurationsmanagement-Backend (in Entwicklung).
 
 ## Schnellstart
 
@@ -424,6 +431,88 @@ docker-compose up mongodb-init
 ./scripts/verify-mongodb.sh
 ```
 
+### Transform Engine
+
+ElasticRelay enthält eine vollständige Datentransformations-Pipeline, konfigurierbar über eine separate JSON-Datei (`-transform-config`):
+
+#### Feld-Mapping
+- **Umbenennen**: Feldnamen ändern (z. B. `user_name` → `username`)
+- **Kopieren**: Felder unter neuen Namen duplizieren und Originale beibehalten
+- **Verschachtelte Pfade**: Zugriff und Änderung verschachtelter Felder per Punktnotation (`user.profile.name`)
+- **Feldausschluss**: Sensible oder unnötige Felder vor der Indexierung entfernen
+
+#### Typkonvertierung
+
+| Quelltyp | Zieltypen |
+|----------|-----------|
+| string | int, int64, float64, bool, date, timestamp |
+| int/int64 | string, float64, bool, timestamp |
+| float64 | string, int, int64, bool |
+| bool | string, int |
+| time.Time | string (RFC3339), timestamp (Unix) |
+
+#### Datenmaskierung
+
+| Vorlage | Eingabe | Ausgabe |
+|---------|---------|---------|
+| `phone` | `13812345678` | `138****5678` |
+| `id_card` | `110101199001011234` | `1101**********1234` |
+| `email` | `john@example.com` | `jo***@example.com` |
+| `bank_card` | `6222021234567890` | `6222********7890` |
+| `name` | `张三` | `张*` |
+
+Maskierungsstrategien: `mask` (Zeichenmaskierung), `hash` (SHA256/MD5), `token` (Tokenisierung), `regex` (Musteraustausch).
+
+#### Ausdrucks-Engine
+
+Eingebaute Funktionen für berechnete Felder:
+
+| Kategorie | Funktionen |
+|-----------|------------|
+| String | `concat()`, `substr()`, `upper()`, `lower()`, `trim()`, `replace()`, `length()` |
+| Mathematik | `round()`, `abs()`, `floor()`, `ceil()`, `min()`, `max()` |
+| Datum | `now()`, `formatDate()`, `parseDate()` |
+| Bedingt | `ifNull()`, `ifEmpty()`, `coalesce()` |
+
+Beispielausdrücke:
+```javascript
+$.age < 18 ? 'minor' : 'adult'
+concat($.first_name, ' ', $.last_name)
+round($.price * $.quantity, 2)
+```
+
+#### Bedingte Filterung
+
+| Operator | Beschreibung | Beispiel |
+|----------|--------------|----------|
+| `eq` | Gleich | `status == "active"` |
+| `ne` | Ungleich | `status != "deleted"` |
+| `gt` / `gte` | Größer (oder gleich) | `age > 18` |
+| `lt` / `lte` | Kleiner (oder gleich) | `price < 100` |
+| `in` / `nin` | In / nicht in Liste | `type in ["a", "b"]` |
+| `regex` | Regex-Übereinstimmung | `email ~ ".*@example.com"` |
+| `exists` | Feld existiert | `email exists` |
+
+#### Transform-Konfiguration
+
+```sh
+# Mit Transform-Regeln ausführen
+./bin/elasticrelay -config multi_config.json -transform-config ./config/mysql_transform.json
+
+# Ohne Transform (Pass-Through-Modus, Standard)
+./bin/elasticrelay -config multi_config.json
+```
+
+#### Leistung
+
+| Operation | Durchsatz | Speicher |
+|-----------|-----------|----------|
+| Vollständige Transform-Pipeline | ~800.000 Ops/Sek | 1.601 B/Op |
+| Feld-Mapping | ~4.500.000 Ops/Sek | 416 B/Op |
+| Typkonvertierung | ~22.000.000 Ops/Sek | 16 B/Op |
+| Filterauswertung | ~5.000.000 Ops/Sek | ~200 B/Op |
+| Datenmaskierung (4 Felder) | ~1.000.000 Ops/Sek | ~500 B/Op |
+
 ### Parallele Verarbeitung
 
 Erweiterte parallele Snapshot-Verarbeitungsfähigkeiten:
@@ -433,18 +522,27 @@ Erweiterte parallele Snapshot-Verarbeitungsfähigkeiten:
 - **Fortschrittsverfolgung**: Echtzeit-Fortschrittsüberwachung und Statistiken
 - **Große Tabellen Unterstützung**: Optimierte Handhabung großer Tabellen mit intelligentem Chunking
 - **Streaming-Modus**: Speichereffiziente Streaming-Verarbeitung für große Datensätze
+- **Primärschlüssel-Erkennung**: Automatische Erkennung von Primärschlüssel-Spalten für korrekte Dokument-IDs
 
 ## Aktueller Status
 
-**Aktuelle Version**: v1.3.1 | **Phase**: Phase 2 Abgeschlossen ✅, Eintritt in Phase 3
+**Aktuelle Version**: v1.4.4 | **Phase**: Phase 2 Abgeschlossen ✅, Phase 3 in Arbeit (Transform Engine abgeschlossen)
 
-Dieses Projekt hat seine Kern Multi-Source CDC Plattform (Phase 2) abgeschlossen und bereitet sich auf Enterprise-Grade Erweiterungen vor.
+Dieses Projekt hat seine Kern-Multi-Source-CDC-Plattform (Phase 2) abgeschlossen und die Transform Engine als ersten großen Meilenstein von Phase 3 geliefert. PostgreSQL-CDC wurde mit umfangreichen Stabilitätsfixes produktionsgehärtet.
 
-### ✅ Abgeschlossene Features (Phase 2 - v1.3.1)
+### ✅ Abgeschlossene Features (v1.4.4)
 - **Multi-Source CDC Pipeline**: 
-  - **MySQL CDC**: Vollständige Implementierung mit binlog-basierter Echtzeit-Synchronisierung
-  - **PostgreSQL CDC**: Vollständige logische Replikation mit WAL-Parsing, Replikationsslots und Publications
-  - **MongoDB CDC**: Vollständige Change Streams Implementierung mit Replica Set und Sharded Cluster Unterstützung
+  - **MySQL CDC**: Vollständige Implementierung mit binlog-basierter Echtzeit-Synchronisierung und konsistenter Datums-/Zeitbehandlung
+  - **PostgreSQL CDC**: Produktionsgehärtete logische Replikation mit WAL-Parsing, Replikationsslots, Publications, stabilem Snapshot-zu-CDC-Übergang, asynchroner Batch-Entkopplung und jobbezogenem Replikationsslot-Management
+  - **MongoDB CDC**: Vollständige Change-Streams-Implementierung mit Replica-Set- und Sharded-Cluster-Unterstützung
+- **Transform Engine** (v1.4.0+):
+  - Feld-Mapping (Umbenennen, Kopieren, Verschieben) mit Unterstützung verschachtelter Pfade
+  - Typkonvertierung (string, int, float, bool, date, timestamp, object)
+  - Datenmaskierung (Telefon, Ausweis, E-Mail, Bankkarte, Name) mit 4 Strategien
+  - Ausdrucks-Engine mit 16 eingebauten Funktionen
+  - Bedingte Filterung mit 10 Operatoren und Include-/Exclude-/Route-Aktionen
+  - Prioritätsbasierte Mehrfachregel-Zuordnung mit Tabellenmuster-Wildcards
+  - Leistung: 800.000+ Ops/Sek (80× über dem Designziel)
 - **Multi-Table Dynamische Indexierung**: Automatische Elasticsearch-Index-Erstellung und -Verwaltung pro Tabelle mit konfigurierbarer Benennung
 - **gRPC Architektur**: Vollständige Service-Definitionen und Implementierungen (Connector, Orchestrator, Sink, Transform, Health)
 - **Erweitertes Konfigurationsmanagement**: 
@@ -453,7 +551,6 @@ Dieses Projekt hat seine Kern Multi-Source CDC Plattform (Phase 2) abgeschlossen
   - Automatische Formaterkennung und Migrationstools
 - **Elasticsearch Integration**: Hochleistungs-Bulk-Schreiben mit automatischem Index-Management und Datenbereinigung
 - **Checkpoint/Resume**: Persistente Positionsverfolgung für Fehlertoleranz mit automatischer Wiederherstellung (binlog, LSN, resume tokens)
-- **Datentransformation**: Vollständige Pipeline für Datenverarbeitung und Governance (pass-through, vollständige Engine in Phase 3)
 - **Dead Letter Queue (DLQ)**: 
   - Umfassendes DLQ-System mit exponentiellem Backoff-Retry (konfigurierbare max. Wiederholungen)
   - Persistenter Speicher mit Deduplizierung und Status-Tracking
@@ -461,15 +558,15 @@ Dieses Projekt hat seine Kern Multi-Source CDC Plattform (Phase 2) abgeschlossen
   - Unterstützung für manuelle Element-Verwaltung und -Inspektion
 - **Parallele Verarbeitung**: 
   - Erweiterte parallele Snapshot-Verarbeitung mit Chunking-Strategien
+  - Automatische Primärschlüssel-Erkennung für korrekte Dokument-ID-Generierung
   - Konfigurierbare Worker-Pools und adaptive Planung
   - Fortschrittsverfolgung und Statistiksammlung
   - Unterstützung für große Tabellenoptimierung (MySQL, PostgreSQL, MongoDB)
 - **Versionsverwaltung**: Vollständiges Versionsinjektionssystem mit Build-Zeit-Metadaten
 - **Robuste Fehlerbehandlung**: Umfassende Fehlerbehandlung mit Fallback-Mechanismen
-- **Log-Level-Steuerung**: Zur Laufzeit konfigurierbare Protokollierung mit zentraler Verwaltung
+- **Log-Level-Steuerung**: Zentralisiertes Logging-System (debug/info/warn/error) mit Laufzeitkonfiguration und thread-sicherer globaler Steuerung
 
-### 🚧 In Arbeit (Phase 3 - v1.0-beta)
-- **Transform Engine**: Vollständige Datentransformationsimplementierung (Feld-Mapping, Typ-Konvertierung, Ausdrücke, Maskierung)
+### 🚧 In Arbeit (Phase 3 Verbleibend)
 - **Prometheus Metrics**: Vollständige Observability mit Metrik-Export
 - **HTTP REST API**: grpc-gateway Integration mit OpenAPI-Dokumentation
 - **Health Check Erweiterung**: Kubernetes-ready Readiness/Liveness Probes
