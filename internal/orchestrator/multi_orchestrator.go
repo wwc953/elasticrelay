@@ -84,8 +84,9 @@ type MultiJob struct {
 	useParallel     bool
 
 	// Job configuration access
-	jobOptions map[string]interface{}
-	sinkConfig map[string]interface{} // Sink configuration for index naming, etc.
+	jobOptions     map[string]interface{}
+	sinkConfig     map[string]interface{} // Sink configuration for index naming, etc.
+	fullSinkConfig *config.SinkConfig     // Full sink config including addresses, user, password
 
 	// Dead Letter Queue management (shared from orchestrator)
 	dlqManager *dlq.DLQManager
@@ -295,10 +296,12 @@ func (mo *MultiOrchestrator) CreateJob(ctx context.Context, req *pb.CreateJobReq
 
 	// Get sink configuration from multiConfig
 	var sinkConfig map[string]interface{}
+	var fullSinkConfig *config.SinkConfig
 	if mo.multiConfig != nil {
-		for _, sink := range mo.multiConfig.Sinks {
+		for i, sink := range mo.multiConfig.Sinks {
 			if sink.ID == jobConfig.SinkID {
 				sinkConfig = sink.Options
+				fullSinkConfig = &mo.multiConfig.Sinks[i]
 				break
 			}
 		}
@@ -327,6 +330,7 @@ func (mo *MultiOrchestrator) CreateJob(ctx context.Context, req *pb.CreateJobReq
 		useParallel:       useParallel,
 		jobOptions:        jobConfig.Options, // Copy job options for configuration access
 		sinkConfig:        sinkConfig,        // Copy sink options for index naming, etc.
+		fullSinkConfig:    fullSinkConfig,    // Full sink config for parallel manager, etc.
 		dlqManager:        mo.dlqManager,     // Share DLQ manager from orchestrator
 		cdcEvents:         make(chan *pb.ChangeEvent, batchSize*20),
 	}
@@ -1138,11 +1142,14 @@ func (j *MultiJob) initializeParallelManager() error {
 		return fmt.Errorf("failed to create database connection: %w", err)
 	}
 
-	// Create ES client (simplified)
+	// Create ES client from sink configuration
+	if j.fullSinkConfig == nil || len(j.fullSinkConfig.Addresses) == 0 {
+		return fmt.Errorf("sink configuration missing or has no addresses for parallel manager")
+	}
 	esClient := parallel.NewSimpleESClient(
-		"http://172.168.0.100:19200", // TODO: Get from sink config
-		"elastic",
-		"zIUPPogxwxCR",
+		j.fullSinkConfig.Addresses[0],
+		j.fullSinkConfig.User,
+		j.fullSinkConfig.Password,
 	)
 
 	// Create parallel snapshot manager for MySQL

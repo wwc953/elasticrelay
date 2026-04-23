@@ -1,5 +1,37 @@
 # ElasticRelay Changelog
 
+## [v1.4.5] - 2026-04-24
+
+### 🐛 Bug Fixes
+
+#### 1. Hardcoded Elasticsearch Connection in Parallel Snapshot Manager (`internal/orchestrator/multi_orchestrator.go`)
+
+**Fixed parallel snapshot manager using hardcoded ES connection instead of sink configuration:**
+
+- **Issue**: The `initParallelManager()` method created an ES client with hardcoded URL (`http://172.168.0.100:19200`), username (`elastic`), and password (`zIUPPogxwxCR`), ignoring the actual sink configuration
+- **Root Cause**: `MultiJob` only stored `sink.Options` (a `map[string]interface{}`) but not the full `SinkConfig` struct, so connection details (`Addresses`, `User`, `Password`) were unavailable when initializing the parallel manager
+- **Fix**:
+  1. Added `fullSinkConfig *config.SinkConfig` field to `MultiJob` struct
+  2. Updated `CreateJob()` to store the complete `SinkConfig` reference alongside the existing `Options` map
+  3. Replaced hardcoded ES client parameters in `initParallelManager()` with values from `fullSinkConfig.Addresses[0]`, `fullSinkConfig.User`, and `fullSinkConfig.Password`
+  4. Added validation to return a clear error when sink configuration is missing or has no addresses
+- **Impact**: Parallel snapshot manager now correctly uses the ES connection configured in `sinks[].addresses`, `sinks[].user`, and `sinks[].password` from the multi-config file, eliminating the need to modify source code for different environments
+- **Security**: Removed hardcoded credentials from source code
+
+### ✅ Verification
+
+After this fix:
+
+- Parallel snapshot manager reads ES connection details from sink configuration instead of hardcoded values
+- Missing or incomplete sink configuration produces a descriptive error rather than silently using wrong credentials
+- Existing non-parallel sync behavior remains unchanged
+
+Validation performed:
+
+- `go vet ./internal/orchestrator/` — passed with no errors
+
+---
+
 ## [v1.4.4] - 2026-03-11
 
 ### 🔧 PostgreSQL Snapshot-to-CDC and CDC Stability Fixes

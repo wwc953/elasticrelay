@@ -1,5 +1,37 @@
 # ElasticRelay 修改日志
 
+## [v1.4.5] - 2026-04-24
+
+### 🐛 问题修复
+
+#### 1. 并行快照管理器使用硬编码 ES 连接信息 (`internal/orchestrator/multi_orchestrator.go`)
+
+**修复并行快照管理器忽略 sink 配置、使用硬编码 ES 连接参数的问题：**
+
+- **问题：** `initParallelManager()` 方法创建 ES 客户端时使用了硬编码的 URL（`http://172.168.0.100:19200`）、用户名（`elastic`）和密码（`zIUPPogxwxCR`），完全忽略了实际的 sink 配置
+- **根本原因：** `MultiJob` 只保存了 `sink.Options`（`map[string]interface{}`），没有保存完整的 `SinkConfig` 结构体，导致初始化并行管理器时无法获取 `Addresses`、`User`、`Password` 等连接信息
+- **修复：**
+  1. 在 `MultiJob` 结构体中新增 `fullSinkConfig *config.SinkConfig` 字段
+  2. 在 `CreateJob()` 中同时保存完整的 `SinkConfig` 引用
+  3. 将 `initParallelManager()` 中硬编码的 ES 客户端参数替换为 `fullSinkConfig.Addresses[0]`、`fullSinkConfig.User`、`fullSinkConfig.Password`
+  4. 增加校验逻辑，当 sink 配置缺失或无地址时返回明确的错误信息
+- **影响：** 并行快照管理器现在会正确使用多配置文件中 `sinks[].addresses`、`sinks[].user`、`sinks[].password` 配置的 ES 连接信息，无需为不同环境修改源代码
+- **安全：** 移除了源代码中的硬编码凭据
+
+### ✅ 验证
+
+修复后：
+
+- 并行快照管理器从 sink 配置读取 ES 连接信息，不再使用硬编码值
+- sink 配置缺失或不完整时会返回描述性错误，而不是静默使用错误的凭据
+- 非并行同步行为不受影响
+
+验证方式：
+
+- `go vet ./internal/orchestrator/` — 通过，无报错
+
+---
+
 ## [v1.4.4] - 2026-03-11
 
 ### 🔧 PostgreSQL 快照到 CDC 衔接与稳定性修复
