@@ -2,6 +2,7 @@
 package filter
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -327,6 +328,9 @@ func toFloat64(value interface{}) (float64, bool) {
 		return float64(v), true
 	case uint64:
 		return float64(v), true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
 	default:
 		return 0, false
 	}
@@ -359,6 +363,14 @@ func toInt(value interface{}) (int, bool) {
 		return int(v), true
 	case float64:
 		return int(v), true
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return int(i), true
+		}
+		if f, err := v.Float64(); err == nil {
+			return int(f), true
+		}
+		return 0, false
 	default:
 		return 0, false
 	}

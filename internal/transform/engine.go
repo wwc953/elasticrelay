@@ -103,9 +103,12 @@ func (e *Engine) Transform(ctx context.Context, event *pb.ChangeEvent) (*pb.Chan
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// Parse event data
+	// Parse event data using UseNumber() to preserve numeric representations
+	// (e.g. "3200.00" stays as json.Number instead of becoming float64(3200))
 	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(event.Data), &data); err != nil {
+	dec := json.NewDecoder(strings.NewReader(event.Data))
+	dec.UseNumber()
+	if err := dec.Decode(&data); err != nil {
 		e.stats.IncrementError()
 		return nil, false, fmt.Errorf("failed to parse event data: %w", err)
 	}

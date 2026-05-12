@@ -4,6 +4,7 @@
 package expression
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"regexp"
@@ -322,7 +323,7 @@ func (e *Engine) tryArithmetic(expr string, data map[string]interface{}) (interf
 				result = leftNum / rightNum
 			}
 
-			return result, true, nil
+			return floatToJSONNumber(result), true, nil
 		}
 	}
 
@@ -398,6 +399,9 @@ func toFloat64(v interface{}) float64 {
 		return float64(val)
 	case int64:
 		return float64(val)
+	case json.Number:
+		f, _ := val.Float64()
+		return f
 	case string:
 		f, _ := strconv.ParseFloat(val, 64)
 		return f
@@ -503,7 +507,7 @@ func funcLength(args []interface{}) (interface{}, error) {
 
 func funcRound(args []interface{}) (interface{}, error) {
 	if len(args) < 1 {
-		return 0.0, nil
+		return json.Number("0"), nil
 	}
 	val := toFloat64(args[0])
 	precision := 0
@@ -511,28 +515,29 @@ func funcRound(args []interface{}) (interface{}, error) {
 		precision = int(toFloat64(args[1]))
 	}
 	pow := math.Pow(10, float64(precision))
-	return math.Round(val*pow) / pow, nil
+	result := math.Round(val*pow) / pow
+	return json.Number(strconv.FormatFloat(result, 'f', precision, 64)), nil
 }
 
 func funcAbs(args []interface{}) (interface{}, error) {
 	if len(args) < 1 {
-		return 0.0, nil
+		return json.Number("0"), nil
 	}
-	return math.Abs(toFloat64(args[0])), nil
+	return floatToJSONNumber(math.Abs(toFloat64(args[0]))), nil
 }
 
 func funcFloor(args []interface{}) (interface{}, error) {
 	if len(args) < 1 {
-		return 0.0, nil
+		return json.Number("0"), nil
 	}
-	return math.Floor(toFloat64(args[0])), nil
+	return floatToJSONNumber(math.Floor(toFloat64(args[0]))), nil
 }
 
 func funcCeil(args []interface{}) (interface{}, error) {
 	if len(args) < 1 {
-		return 0.0, nil
+		return json.Number("0"), nil
 	}
-	return math.Ceil(toFloat64(args[0])), nil
+	return floatToJSONNumber(math.Ceil(toFloat64(args[0]))), nil
 }
 
 func funcMin(args []interface{}) (interface{}, error) {
@@ -546,7 +551,7 @@ func funcMin(args []interface{}) (interface{}, error) {
 			min = val
 		}
 	}
-	return min, nil
+	return floatToJSONNumber(min), nil
 }
 
 func funcMax(args []interface{}) (interface{}, error) {
@@ -560,7 +565,17 @@ func funcMax(args []interface{}) (interface{}, error) {
 			max = val
 		}
 	}
-	return max, nil
+	return floatToJSONNumber(max), nil
+}
+
+// floatToJSONNumber formats a float64 as json.Number, ensuring a decimal point
+// is always present so ES consistently maps the field as float, not long.
+func floatToJSONNumber(f float64) json.Number {
+	s := strconv.FormatFloat(f, 'f', -1, 64)
+	if !strings.Contains(s, ".") {
+		s += ".0"
+	}
+	return json.Number(s)
 }
 
 func funcNow(args []interface{}) (interface{}, error) {

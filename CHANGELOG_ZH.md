@@ -1,5 +1,83 @@
 # ElasticRelay 修改日志
 
+## [v1.4.6] - 2026-05-12
+
+### 🐛 问题修复
+
+#### 1. MySQL DECIMAL 类型导致 Elasticsearch 字段映射冲突 (`internal/connectors/mysql/mysql.go`, `internal/parallel/worker.go`)
+
+**修复 MySQL DECIMAL 列同步时触发 `mapper [field] cannot be changed from type [long] to [float]` 错误的问题：**
+
+- **问题：** 同步含有 `DECIMAL` 列的表（如 `balance DECIMAL(12,2)`）时失败，报错 `illegal_argument_exception: mapper [balance] cannot be changed from type [long] to [float]`
+- **根本原因：** Go MySQL 驱动以 `[]byte` 形式返回 `DECIMAL` 值。原有代码使用 `strconv.ParseFloat` 将其转为 `float64`，而 Go 的 `json.Marshal` 会吞掉整数浮点数的小数点——例如 `float64(3200)` 序列化为 JSON `3200`（无小数点），而 `float64(1500.5)` 序列化为 `1500.5`。Elasticsearch 动态映射在首次遇到整数值时将字段推断为 `long`，后续遇到带小数的值时因类型冲突而拒绝写入
+- **修复：** 将三处 `[]byte` → 数值转换路径中 `ParseFloat` 成功后的赋值从 `float64` 改为 `json.Number(s)`。`json.Number` 会保留原始字符串表示，因此 `"3200.00"` 在 JSON 中仍然是 `3200.00`，`"0.00"` 仍然是 `0.00`，确保 Elasticsearch 始终将该字段映射为 `float`
+- **影响：** 所有 MySQL `DECIMAL` 字段现在都会在 JSON 输出中保留小数表示，从而避免 Elasticsearch 动态映射在整数值和小数值之间产生类型冲突
+- **变更文件：**
+  - `internal/connectors/mysql/mysql.go` — CDC binlog 处理器和快照处理器（2 处）
+  - `internal/parallel/worker.go` — 并行快照 worker 的 `convertValue()` 函数
+
+```go
+// 修复前：整数 DECIMAL 值在 JSON 中丢失小数点
+} else if f, err := strconv.ParseFloat(s, 64); err == nil {
+    dataMap[colName] = f  // float64(3200) → JSON "3200" → ES 推断为 long
+
+// 修复后：保留原始小数表示
+} else if _, err := strconv.ParseFloat(s, 64); err == nil {
+    dataMap[colName] = json.Number(s)  // "3200.00" → JSON "3200.00" → ES 推断为 float
+```
+
+#### 2. JSON 反序列化/序列化往返丢失小数点 (`internal/orchestrator/multi_orchestrator.go`, `internal/transform/engine.go`, `internal/sink/es/es.go`)
+
+**修复多个 JSON 往返处理点将 `3200.00` → `float64(3200)` → `3200`，导致 MySQL 连接器的小数保留措施失效的问题：**
+
+- **问题：** 即使 MySQL 连接器正确输出了 `json.Number("3200.00")`，下游的三个 JSON 往返处理点均使用 `json.Unmarshal`（默认将 JSON 数字转为 `float64`），再经 `json.Marshal` 后整数浮点数丢失 `.00`
+- **根本原因：** 标准 `json.Unmarshal` 解析到 `map[string]interface{}` 时，始终将 JSON 数字转为 `float64`，丢失原始字符串表示
+- **修复：** 在所有数据路径的 JSON 往返处理点，将 `json.Unmarshal` 替换为 `json.NewDecoder` + `UseNumber()`：
+  1. `multi_orchestrator.go` `processSnapshotChunk()` — 向快照记录添加 `_table` 和 `_source_id`
+  2. `multi_orchestrator.go` `enrichEventWithSourceID()` — 向 CDC 事件添加 `_source_id`
+  3. `engine.go` `Transform()` — 在应用转换规则前解析事件数据
+  4. `es.go` `cleanDataForES()` — 在写入 ES 前移除元数据字段
+- **影响：** 数值现在可以在整条流水线中不丢失其小数表示
+
+#### 3. Transform 引擎计算浮点字段导致同样的 ES 映射冲突 (`internal/transform/expression/engine.go`, `internal/transform/type_converter.go`, `internal/transform/filter/filter.go`)
+
+**修复 Transform 引擎的数学函数和类型转换器产生裸 `float64` 值，导致 Elasticsearch 出现同样的 `long` 与 `float` 映射冲突的问题：**
+
+- **问题：** 使用 `round($.balance, 2)` 的计算字段（如 `display_balance`）触发 `mapper [display_balance] cannot be changed from type [float] to [long]`，因为 `round(3200.00, 2)` 返回 `float64(3200)` → JSON `3200`（无小数点），而 `round(1500.50, 2)` → JSON `1500.5`
+- **根本原因：** 表达式引擎的所有数学函数（`round`、`abs`、`floor`、`ceil`、`min`、`max`）和算术运算符都返回裸 `float64` 值，在 JSON 序列化时整数浮点数会丢失小数点
+- **修复：**
+  1. **表达式引擎数学函数**：`funcRound` 现在返回按指定精度格式化的 `json.Number`（如 `round(3200.00, 2)` → `json.Number("3200.00")`）。其他数学函数和算术运算符使用 `floatToJSONNumber()` 辅助函数，确保整数值始终附加 `.0`
+  2. **类型转换器**：`toFloat64` 现在返回 `json.Number` 而不是裸 `float64`，确保 `target_type: "float64"` 的字段同样安全
+  3. **json.Number 输入处理**：在三个包（表达式引擎、类型转换器、过滤引擎）的 `toFloat64`、`toInt`、`toInt64`、`toBool` 中添加了 `json.Number` 分支，因为 MySQL 连接器现在对 DECIMAL 列输出 `json.Number` 值
+- **影响：** Transform 引擎中所有产生浮点数的路径现在都输出 JSON 安全的表示，ES 始终将其映射为 `float`
+- **变更文件：**
+  - `internal/transform/expression/engine.go` — 数学函数、算术运算、`toFloat64` 辅助函数
+  - `internal/transform/type_converter.go` — `toFloat64`、`toInt`、`toInt64`、`toBool` 转换器
+  - `internal/transform/filter/filter.go` — `toFloat64`、`toInt` 比较辅助函数
+
+### ⚠️ 迁移说明
+
+如果之前已触发此错误，现有 Elasticsearch 索引的映射已损坏，需要在重启前删除受影响的索引：
+
+```bash
+curl -u <用户名>:<密码> -X DELETE "http://<ES地址>:<端口>/elasticrelay_mysql-<表名>"
+```
+
+下次运行将使用正确的动态映射重新创建索引。
+
+### ✅ 验证
+
+修复后：
+
+- MySQL `DECIMAL` 字段（如 `balance DECIMAL(12,2)`）的值 `0.00`、`100.00`、`1500.50` 在 JSON 中均带小数点序列化
+- 计算字段（如 `display_balance = round($.balance, 2)`）始终在 JSON 中生成 `3200.00`、`1500.50` 等带小数点的值
+- `target_type: "float64"` 的类型转换字段始终包含小数点
+- Elasticsearch 始终将这些字段映射为 `float`，消除了 `long` 与 `float` 的类型冲突
+- 过滤比较和表达式求值能正确处理 `json.Number` 输入值
+- 现有非浮点字段的行为（整数、字符串、日期时间、布尔）不受影响
+
+---
+
 ## [v1.4.5] - 2026-04-24
 
 ### 🐛 问题修复

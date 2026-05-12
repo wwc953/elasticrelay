@@ -215,57 +215,61 @@ func (h *eventHandler) handleRowsEvent(header *replication.EventHeader, table *r
 				dataMap[colName] = nil
 			} else {
 				switch v := colData.(type) {
-				case []byte:
-					// Ensure proper handling of UTF-8 encoded byte data
-					s := string(v)
-					// Try datetime parsing first for potential datetime fields
-					if parsed, ok := tryParseDateTime(s); ok {
-						dataMap[colName] = parsed
-					} else if len(s) <= 10 {
-						// Only convert to number if string is short enough to avoid precision issues
-						// This prevents phone numbers (11 digits), ID cards (18 digits), bank cards (16-19 digits)
-						// from being converted to numbers and losing precision in JSON
-						if num, err := strconv.ParseInt(s, 10, 64); err == nil {
-							dataMap[colName] = num
-						} else if f, err := strconv.ParseFloat(s, 64); err == nil {
-							dataMap[colName] = f
-						} else if b, err := strconv.ParseBool(s); err == nil {
-							dataMap[colName] = b
-						} else {
-							dataMap[colName] = s
-						}
+			case []byte:
+				// Ensure proper handling of UTF-8 encoded byte data
+				s := string(v)
+				// Try datetime parsing first for potential datetime fields
+				if parsed, ok := tryParseDateTime(s); ok {
+					dataMap[colName] = parsed
+				} else if len(s) <= 10 {
+					// Only convert to number if string is short enough to avoid precision issues
+					// This prevents phone numbers (11 digits), ID cards (18 digits), bank cards (16-19 digits)
+					// from being converted to numbers and losing precision in JSON
+					if num, err := strconv.ParseInt(s, 10, 64); err == nil {
+						dataMap[colName] = num
+					} else if _, err := strconv.ParseFloat(s, 64); err == nil {
+						// Use json.Number to preserve the original decimal representation.
+						// This prevents ES type conflicts: e.g. DECIMAL "3200.00" would become
+						// float64(3200) → JSON "3200" (inferred as long), but "1500.50" → JSON "1500.5"
+						// (inferred as float), causing a mapping conflict.
+						dataMap[colName] = json.Number(s)
+					} else if b, err := strconv.ParseBool(s); err == nil {
+						dataMap[colName] = b
 					} else {
-						// For long numeric strings (phone, ID card, bank card), keep as string
-						// to avoid precision loss in JSON serialization
-						// Ensure strings are properly handled as UTF-8
-						if !utf8.Valid(v) {
-							log.Printf("Invalid UTF-8 data in column %s, attempting to fix", colName)
-							// Attempt to fix possible encoding issues
-							s = string([]rune(string(v)))
-						}
 						dataMap[colName] = s
 					}
-				case string:
-					// Handle string datetime values
-					if parsed, ok := tryParseDateTime(v); ok {
-						dataMap[colName] = parsed
-					} else {
-						dataMap[colName] = v
+				} else {
+					// For long numeric strings (phone, ID card, bank card), keep as string
+					// to avoid precision loss in JSON serialization
+					// Ensure strings are properly handled as UTF-8
+					if !utf8.Valid(v) {
+						log.Printf("Invalid UTF-8 data in column %s, attempting to fix", colName)
+						// Attempt to fix possible encoding issues
+						s = string([]rune(string(v)))
 					}
-				case time.Time:
-					dataMap[colName] = v.UTC().Format(time.RFC3339Nano)
-				default:
+					dataMap[colName] = s
+				}
+			case string:
+				// Handle string datetime values
+				if parsed, ok := tryParseDateTime(v); ok {
+					dataMap[colName] = parsed
+				} else {
 					dataMap[colName] = v
 				}
+			case time.Time:
+				dataMap[colName] = v.UTC().Format(time.RFC3339Nano)
+			default:
+				dataMap[colName] = v
 			}
 		}
-		jsonData, err := json.Marshal(dataMap)
-		if err != nil {
-			log.Printf("Failed to marshal row to JSON: %v", err)
-			continue
-		}
+	}
+	jsonData, err := json.Marshal(dataMap)
+	if err != nil {
+		log.Printf("Failed to marshal row to JSON: %v", err)
+		continue
+	}
 
-		pkValue, err := h.getPrimaryKey(table, row)
+	pkValue, err := h.getPrimaryKey(table, row)
 		if err != nil {
 			log.Printf("Failed to get primary key: %v", err)
 			continue
@@ -422,39 +426,39 @@ func (s *Server) BeginSnapshot(req *pb.BeginSnapshotRequest, stream pb.Connector
 				dataMap[colName] = nil
 			} else {
 				switch v := (*val).(type) {
-				case []byte:
-					// Ensure proper handling of UTF-8 encoded byte data
-					s := string(v)
-					// Try datetime parsing first for potential datetime fields
-					if parsed, ok := tryParseDateTime(s); ok {
-						dataMap[colName] = parsed
-					} else if len(s) <= 10 {
-						// Only convert to number if string is short enough to avoid precision issues
-						// This prevents phone numbers (11 digits), ID cards (18 digits), bank cards (16-19 digits)
-						// from being converted to numbers and losing precision in JSON
-						if num, err := strconv.ParseInt(s, 10, 64); err == nil {
-							dataMap[colName] = num
-						} else if f, err := strconv.ParseFloat(s, 64); err == nil {
-							dataMap[colName] = f
-						} else if b, err := strconv.ParseBool(s); err == nil {
-							dataMap[colName] = b
-						} else {
-							dataMap[colName] = s
-						}
+			case []byte:
+				// Ensure proper handling of UTF-8 encoded byte data
+				s := string(v)
+				// Try datetime parsing first for potential datetime fields
+				if parsed, ok := tryParseDateTime(s); ok {
+					dataMap[colName] = parsed
+				} else if len(s) <= 10 {
+					// Only convert to number if string is short enough to avoid precision issues
+					// This prevents phone numbers (11 digits), ID cards (18 digits), bank cards (16-19 digits)
+					// from being converted to numbers and losing precision in JSON
+					if num, err := strconv.ParseInt(s, 10, 64); err == nil {
+						dataMap[colName] = num
+					} else if _, err := strconv.ParseFloat(s, 64); err == nil {
+						dataMap[colName] = json.Number(s)
+					} else if b, err := strconv.ParseBool(s); err == nil {
+						dataMap[colName] = b
 					} else {
-						// For long numeric strings (phone, ID card, bank card), keep as string
-						// to avoid precision loss in JSON serialization
-						// Ensure strings are properly handled as UTF-8
-						if !utf8.Valid(v) {
-							log.Printf("Invalid UTF-8 data in column %s, attempting to fix", colName)
-							// Attempt to fix possible encoding issues
-							s = string([]rune(string(v)))
-						}
 						dataMap[colName] = s
 					}
-				case string:
-					// Handle string datetime values  
-					if parsed, ok := tryParseDateTime(v); ok {
+				} else {
+					// For long numeric strings (phone, ID card, bank card), keep as string
+					// to avoid precision loss in JSON serialization
+					// Ensure strings are properly handled as UTF-8
+					if !utf8.Valid(v) {
+						log.Printf("Invalid UTF-8 data in column %s, attempting to fix", colName)
+						// Attempt to fix possible encoding issues
+						s = string([]rune(string(v)))
+					}
+					dataMap[colName] = s
+				}
+			case string:
+				// Handle string datetime values  
+				if parsed, ok := tryParseDateTime(v); ok {
 						dataMap[colName] = parsed
 					} else {
 						dataMap[colName] = v

@@ -756,7 +756,9 @@ func (j *MultiJob) enrichEventWithSourceID(event *pb.ChangeEvent) {
 		return
 	}
 	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(event.Data), &data); err != nil {
+	dec := json.NewDecoder(strings.NewReader(event.Data))
+	dec.UseNumber()
+	if err := dec.Decode(&data); err != nil {
 		return
 	}
 	// Only add _source_id if not already present
@@ -1437,9 +1439,13 @@ func (j *MultiJob) processSnapshotChunk(chunk *pb.SnapshotChunk, tableName strin
 
 	// Convert snapshot records to ChangeEvents
 	for _, record := range chunk.Records {
-		// Parse the JSON record to extract primary key
+		// Parse the JSON record to extract primary key.
+		// UseNumber() preserves numeric representations (e.g. "3200.00" stays as
+		// json.Number instead of becoming float64(3200)), preventing ES type conflicts.
 		var recordData map[string]interface{}
-		if err := json.Unmarshal([]byte(record), &recordData); err != nil {
+		dec := json.NewDecoder(strings.NewReader(record))
+		dec.UseNumber()
+		if err := dec.Decode(&recordData); err != nil {
 			log.Printf("MultiJob '%s': Failed to parse record JSON from table '%s': %v", j.ID, tableName, err)
 			continue
 		}

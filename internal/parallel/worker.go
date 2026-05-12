@@ -3,6 +3,7 @@ package parallel
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -237,8 +238,8 @@ func (w *SnapshotWorker) convertValue(val interface{}) interface{} {
 		// Try to parse as numbers first
 		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return i
-		} else if f, err := strconv.ParseFloat(s, 64); err == nil {
-			return f
+		} else if _, err := strconv.ParseFloat(s, 64); err == nil {
+			return json.Number(s)
 		} else if b, err := strconv.ParseBool(s); err == nil {
 			return b
 		} else {

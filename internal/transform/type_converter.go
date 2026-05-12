@@ -1,8 +1,10 @@
 package transform
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -125,12 +127,18 @@ func (tc *TypeConverter) toInt(value interface{}) (interface{}, error) {
 		return int(v), nil
 	case float64:
 		return int(v), nil
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return int(i), nil
+		}
+		if f, err := v.Float64(); err == nil {
+			return int(f), nil
+		}
+		return nil, fmt.Errorf("cannot convert json.Number '%s' to int", v)
 	case string:
-		// Try to parse as integer first
 		if i, err := strconv.Atoi(v); err == nil {
 			return i, nil
 		}
-		// Try to parse as float and convert
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return int(f), nil
 		}
@@ -172,12 +180,18 @@ func (tc *TypeConverter) toInt64(value interface{}) (interface{}, error) {
 		return int64(v), nil
 	case float64:
 		return int64(v), nil
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, nil
+		}
+		if f, err := v.Float64(); err == nil {
+			return int64(f), nil
+		}
+		return nil, fmt.Errorf("cannot convert json.Number '%s' to int64", v)
 	case string:
-		// Try to parse as integer first
 		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return i, nil
 		}
-		// Try to parse as float and convert
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return int64(f), nil
 		}
@@ -192,47 +206,66 @@ func (tc *TypeConverter) toInt64(value interface{}) (interface{}, error) {
 	}
 }
 
-// toFloat64 converts a value to float64.
+// toFloat64 converts a value to a JSON-safe float representation.
+// Returns json.Number to ensure decimal points are preserved in JSON output,
+// preventing ES dynamic mapping from inferring whole-number floats as long.
 func (tc *TypeConverter) toFloat64(value interface{}) (interface{}, error) {
 	switch v := value.(type) {
+	case json.Number:
+		if _, err := v.Float64(); err != nil {
+			return nil, fmt.Errorf("cannot convert json.Number '%s' to float64: %w", v, err)
+		}
+		s := string(v)
+		if !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return json.Number(s), nil
 	case float64:
-		return v, nil
+		return tc.floatToJSONNumber(v), nil
 	case float32:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case int:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case int8:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case int16:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case int32:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case int64:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case uint:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case uint8:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case uint16:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case uint32:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case uint64:
-		return float64(v), nil
+		return tc.floatToJSONNumber(float64(v)), nil
 	case string:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return nil, fmt.Errorf("cannot convert string '%s' to float64: %w", v, err)
 		}
-		return f, nil
+		return tc.floatToJSONNumber(f), nil
 	case bool:
 		if v {
-			return float64(1), nil
+			return json.Number("1.0"), nil
 		}
-		return float64(0), nil
+		return json.Number("0.0"), nil
 	default:
 		return nil, fmt.Errorf("cannot convert %T to float64", value)
 	}
+}
+
+func (tc *TypeConverter) floatToJSONNumber(f float64) json.Number {
+	s := strconv.FormatFloat(f, 'f', -1, 64)
+	if !strings.Contains(s, ".") {
+		s += ".0"
+	}
+	return json.Number(s)
 }
 
 // toBool converts a value to bool.
@@ -246,6 +279,9 @@ func (tc *TypeConverter) toBool(value interface{}) (interface{}, error) {
 		return v != 0, nil
 	case float64:
 		return v != 0, nil
+	case json.Number:
+		f, _ := v.Float64()
+		return f != 0, nil
 	case string:
 		// Handle common boolean string representations
 		switch v {

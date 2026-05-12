@@ -1,5 +1,83 @@
 # ElasticRelay Changelog
 
+## [v1.4.6] - 2026-05-12
+
+### 🐛 Bug Fixes
+
+#### 1. MySQL DECIMAL Type Causes Elasticsearch Field Mapping Conflict (`internal/connectors/mysql/mysql.go`, `internal/parallel/worker.go`)
+
+**Fixed MySQL DECIMAL columns triggering `mapper [field] cannot be changed from type [long] to [float]` errors in Elasticsearch:**
+
+- **Issue**: Syncing tables with `DECIMAL` columns (e.g. `balance DECIMAL(12,2)`) failed with `illegal_argument_exception: mapper [balance] cannot be changed from type [long] to [float]`
+- **Root Cause**: The Go MySQL driver returns `DECIMAL` values as `[]byte`. The existing code parsed them with `strconv.ParseFloat`, producing `float64` values. Go's `json.Marshal` drops trailing zeros from whole-number floats — e.g. `float64(3200)` serializes as JSON `3200` (no decimal point), while `float64(1500.5)` serializes as `1500.5`. Elasticsearch's dynamic mapping inferred `long` for the first document with a whole-number balance, then rejected subsequent documents with fractional values as a type conflict
+- **Fix**: Changed all three `[]byte` → numeric conversion paths to use `json.Number(s)` instead of `float64` when `ParseFloat` succeeds. `json.Number` preserves the original string representation, so `"3200.00"` stays `3200.00` in JSON and `"0.00"` stays `0.00`, ensuring Elasticsearch consistently maps the field as `float`
+- **Impact**: All MySQL `DECIMAL` fields now retain their decimal representation in JSON output, preventing Elasticsearch dynamic mapping type conflicts between whole-number and fractional values
+- **Files Changed**:
+  - `internal/connectors/mysql/mysql.go` — CDC binlog handler and snapshot handler (2 locations)
+  - `internal/parallel/worker.go` — parallel snapshot worker `convertValue()` function
+
+```go
+// Before: whole-number DECIMALs lost decimal point in JSON
+} else if f, err := strconv.ParseFloat(s, 64); err == nil {
+    dataMap[colName] = f  // float64(3200) → JSON "3200" → ES infers long
+
+// After: original decimal representation preserved
+} else if _, err := strconv.ParseFloat(s, 64); err == nil {
+    dataMap[colName] = json.Number(s)  // "3200.00" → JSON "3200.00" → ES infers float
+```
+
+#### 2. JSON Unmarshal/Marshal Round-Trips Strip Decimal Points (`internal/orchestrator/multi_orchestrator.go`, `internal/transform/engine.go`, `internal/sink/es/es.go`)
+
+**Fixed multiple JSON round-trip points that silently converted `3200.00` → `float64(3200)` → `3200`, undoing the MySQL connector's decimal preservation:**
+
+- **Issue**: Even after the MySQL connector correctly output `json.Number("3200.00")`, three downstream JSON round-trips each used `json.Unmarshal` (which converts JSON numbers to `float64` by default), then `json.Marshal` (which drops `.00` from whole-number floats)
+- **Root Cause**: Standard `json.Unmarshal` into `map[string]interface{}` always converts JSON numbers to `float64`, losing the original string representation
+- **Fix**: Replaced `json.Unmarshal` with `json.NewDecoder` + `UseNumber()` at all three data-path round-trip points:
+  1. `multi_orchestrator.go` `processSnapshotChunk()` — enriches snapshot records with `_table` and `_source_id`
+  2. `multi_orchestrator.go` `enrichEventWithSourceID()` — adds `_source_id` to CDC events
+  3. `engine.go` `Transform()` — parses event data before applying transformation rules
+  4. `es.go` `cleanDataForES()` — removes metadata fields before indexing to ES
+- **Impact**: Numeric values now pass through the entire pipeline without losing their decimal representation
+
+#### 3. Transform Engine Computed Float Fields Cause Same ES Mapping Conflict (`internal/transform/expression/engine.go`, `internal/transform/type_converter.go`, `internal/transform/filter/filter.go`)
+
+**Fixed Transform engine's math functions and type converter producing bare `float64` values that trigger the same `long` vs `float` mapping conflict in Elasticsearch:**
+
+- **Issue**: Computed fields like `display_balance` using `round($.balance, 2)` triggered `mapper [display_balance] cannot be changed from type [float] to [long]` because `round(3200.00, 2)` returned `float64(3200)` → JSON `3200` (no decimal), while `round(1500.50, 2)` → JSON `1500.5`
+- **Root Cause**: All expression engine math functions (`round`, `abs`, `floor`, `ceil`, `min`, `max`) and arithmetic operators returned bare `float64` values, which lose their decimal point for whole numbers during JSON serialization
+- **Fix**:
+  1. **Expression engine math functions**: `funcRound` now returns `json.Number` formatted with the specified precision (e.g. `round(3200.00, 2)` → `json.Number("3200.00")`). Other math functions (`abs`, `floor`, `ceil`, `min`, `max`) and arithmetic operators use a `floatToJSONNumber()` helper that always appends `.0` for whole numbers
+  2. **Type converter**: `toFloat64` now returns `json.Number` instead of bare `float64`, ensuring fields with `target_type: "float64"` are also safe
+  3. **json.Number input handling**: Added `json.Number` case to `toFloat64`, `toInt`, `toInt64`, `toBool` in all three packages (expression engine, type converter, filter engine) since MySQL connector now outputs `json.Number` values for DECIMAL columns
+- **Impact**: All float-producing paths in the Transform engine now output JSON-safe representations that ES consistently maps as `float`
+- **Files Changed**:
+  - `internal/transform/expression/engine.go` — math functions, arithmetic, `toFloat64` helper
+  - `internal/transform/type_converter.go` — `toFloat64`, `toInt`, `toInt64`, `toBool` converters
+  - `internal/transform/filter/filter.go` — `toFloat64`, `toInt` comparison helpers
+
+### ⚠️ Migration Notes
+
+If you previously hit this error, the existing Elasticsearch index has a corrupted mapping. You must delete the affected index before restarting:
+
+```bash
+curl -u <user>:<password> -X DELETE "http://<es-host>:<port>/elasticrelay_mysql-<table>"
+```
+
+The next run will recreate the index with correct dynamic mappings.
+
+### ✅ Verification
+
+After this fix:
+
+- MySQL `DECIMAL` fields like `balance DECIMAL(12,2)` with values `0.00`, `100.00`, `1500.50` all serialize with decimal points in JSON
+- Computed fields like `display_balance = round($.balance, 2)` produce `3200.00`, `1500.50` consistently in JSON
+- Type-converted fields with `target_type: "float64"` always include a decimal point
+- Elasticsearch consistently maps these fields as `float`, eliminating the `long` vs `float` type conflict
+- Filter comparisons and expression evaluations correctly handle `json.Number` input values
+- Existing non-float field behavior (integers, strings, datetimes, booleans) remains unchanged
+
+---
+
 ## [v1.4.5] - 2026-04-24
 
 ### 🐛 Bug Fixes

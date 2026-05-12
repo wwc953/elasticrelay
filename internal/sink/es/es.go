@@ -111,12 +111,17 @@ func (s *Server) generateIndexName(tableName string) string {
 	return s.indexPrefix + "-" + strings.ToLower(tableName)
 }
 
-// cleanDataForES removes metadata fields before storing in Elasticsearch
+// cleanDataForES removes metadata fields before storing in Elasticsearch.
+// Uses json.Decoder with UseNumber() to preserve numeric representations
+// (e.g. "3200.0" stays as-is instead of becoming float64(3200) → "3200"),
+// preventing ES dynamic mapping type conflicts between long and float.
 func (s *Server) cleanDataForES(jsonData string) string {
 	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonData), &data); err != nil {
+	dec := json.NewDecoder(strings.NewReader(jsonData))
+	dec.UseNumber()
+	if err := dec.Decode(&data); err != nil {
 		log.Printf("Failed to parse JSON data for cleaning: %v", err)
-		return jsonData // Return original data if parsing fails
+		return jsonData
 	}
 
 	// Remove metadata fields
@@ -133,7 +138,7 @@ func (s *Server) cleanDataForES(jsonData string) string {
 	cleanedData, err := json.Marshal(data)
 	if err != nil {
 		log.Printf("Failed to re-marshal cleaned data: %v", err)
-		return jsonData // Return original data if re-marshaling fails
+		return jsonData
 	}
 
 	return string(cleanedData)
