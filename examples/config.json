@@ -1,0 +1,10 @@
+{
+  "db_host": "localhost",
+  "db_port": 3306,
+  "db_user": "elastic_user",
+  "db_password": "password",
+  "db_name": "elasticrelay",
+  "server_id": 100,
+  "table_filters": ["users", "orders", "products"],
+  "es_addresses": ["http://localhost:9200"]
+}

@@ -1,6 +1,6 @@
 {
   "mysql-to-es-cdc": {
-    "mysql_binlog_file": "mysql-binlog.000011",
-    "mysql_binlog_pos": 4436
+    "mysql_binlog_file": "mysql-binlog.000007",
+    "mysql_binlog_pos": 765
   }
 }

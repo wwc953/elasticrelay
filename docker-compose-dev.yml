@@ -1,0 +1,133 @@
+services:
+  mysql:
+    image: mysql:latest
+    container_name: elasticrelay-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: elasticrelay
+      MYSQL_USER: elasticrelay_user
+      MYSQL_PASSWORD: elasticrelay_pass
+      # 设置时区
+      TZ: Asia/Shanghai
+      # MySQL初始化参数
+      MYSQL_INITDB_SKIP_TZINFO: 1
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=1
+      - --sync-binlog=1
+      - --binlog-row-metadata=FULL
+      - --log-bin=mysql-binlog
+      - --binlog-format=ROW
+#      - --binlog-do-db=elasticrelay # 只记录指定数据库bin_log
+      - --server-id=1
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --log-slave-updates=ON
+      - --binlog-checksum=CRC32
+      - --master-verify-checksum=ON
+      - --slave-sql-verify-checksum=ON
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpassword}" ]
+      timeout: 20s
+      retries: 10
+      interval: 30s
+    depends_on:
+      - elasticsearch
+#    networks:
+#      - elasticrelay-network
+
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    container_name: elasticrelay-elasticsearch
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - TZ=Asia/Shanghai
+#    volumes:
+#      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+#    networks:
+#      - elasticrelay-network
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.3
+    container_name: kibana73
+    environment:
+#      - I18N_LOCALE=zh-CN
+      - XPACK_GRAPH_ENABLED=true
+      - TIMELION_ENABLED=true
+      - XPACK_MONITORING_COLLECTION_ENABLED="true"
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+
+  elasticrelay:
+    image: elasticrelay:v1.4.4
+    container_name: elasticrelay-standalone
+    ports:
+      - "50051:50051"
+      - "8080:8080"
+    environment:
+      # 时区配置
+      - TZ=Asia/Shanghai
+      # 可选的环境变量配置
+      - LOG_LEVEL=debug
+    volumes:
+      # 配置文件挂载 (智能挂载：文件挂载到 config.json，目录挂载到 config/)
+      - ./config/mysql_config.json:/app/config/config.json:ro
+      # 日志目录挂载
+      - ./logs:/app/logs
+      # DLQ (死信队列) 目录挂载
+      - ./dlq:/app/dlq
+      # 可选：checkpoints 文件挂载
+      - ./checkpoints.json:/app/checkpoints.json
+    # 启动命令配置
+    command: [
+      "--config", "/app/config/config.json",
+      "--port", "50051"
+    ]
+    depends_on:
+      - elasticsearch
+    # 健康检查
+    healthcheck:
+      test: [ "CMD", "sh", "-c", "ps aux | grep elasticrelay | grep -v grep || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # 网络配置 (可选)
+#    networks:
+#      - elasticrelay-network
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+#networks:
+#  elasticrelay-network:
+#    driver: bridge
+#    name: elasticrelay-network
+
+#volumes:
+#  mysql-data:
+#    driver: local
+#  elasticsearch-data:
+#    driver: local

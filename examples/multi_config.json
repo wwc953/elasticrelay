@@ -1,0 +1,69 @@
+{
+  "version": "3.0",
+  "data_sources": [
+    {
+      "id": "mysql-main",
+      "type": "mysql",
+      "host": "localhost",
+      "port": 3306,
+      "user": "elastic_user",
+      "password": "password",
+      "database": "elasticrelay",
+      "server_id": 100,
+      "table_filters": ["users", "orders", "products"]
+    },
+    {
+      "id": "postgresql-main",
+      "type": "postgresql",
+      "host": "localhost",
+      "port": 5432,
+      "user": "elastic_user",
+      "password": "password",
+      "database": "elasticrelay",
+      "table_filters": ["users", "orders", "products"],
+      "options": {
+        "ssl_mode": "disable",
+        "slot_name": "elasticrelay_slot",
+        "publication_name": "elasticrelay_publication",
+        "batch_size": 1000,
+        "max_connections": 10,
+        "parallel_snapshots": true
+      }
+    },
+    {
+      "id": "mongodb-main",
+      "type": "mongodb",
+      "host": "localhost",
+      "port": 27017,
+      "user": "elasticrelay_user",
+      "password": "password",
+      "database": "elasticrelay",
+      "table_filters": ["users", "orders", "products"],
+      "options": {
+        "auth_source": "admin",
+        "replica_set": "rs0"
+      }
+    }
+  ],
+  "sinks": [
+    {
+      "id": "es-main",
+      "type": "elasticsearch",
+      "addresses": ["http://localhost:9200"],
+      "options": {
+        "index_prefix": "elasticrelay"
+      }
+    }
+  ],
+  "jobs": [],
+  "global": {
+    "log_level": "info",
+    "grpc_port": 50051,
+    "dlq_config": {
+      "enabled": true,
+      "storage_path": "dlq",
+      "max_retries": 3,
+      "retry_delay": "30s"
+    }
+  }
+}
